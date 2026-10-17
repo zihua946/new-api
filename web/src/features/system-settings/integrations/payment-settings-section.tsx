@@ -44,8 +44,17 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Textarea } from '@/components/ui/textarea'
 import { handleServerError } from '@/lib/handle-server-error'
 import { cn } from '@/lib/utils'
 
@@ -177,16 +186,46 @@ const paymentSchema = z.object({
   WaffoPancakeMerchantID: z.string(),
   WaffoPancakePrivateKey: z.string(),
   WaffoPancakeReturnURL: z.string(),
+  LianlianEnabled: z.boolean(),
+  LianlianEnv: z.string(),
+  LianlianGateway: z.string().superRefine((value, ctx) => {
+    const trimmed = value.trim().replace(/\/+$/, '')
+    if (trimmed !== '' && !trimmed.endsWith('/mch')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'LianLian gateway must end with /mch, e.g. https://openapi.lianlianpay.com/mch',
+      })
+    }
+  }),
+  LianlianMchId: z.string(),
+  LianlianPrivateKey: z.string(),
+  LianlianPlatformPublicCert: z.string(),
+  LianlianBusiType: z.string(),
 })
+
+/** LianLian settings rendered by the LianLian tab. */
+export type LianlianSettingsValues = {
+  LianlianEnabled: boolean
+  LianlianEnv: string
+  LianlianGateway: string
+  LianlianMchId: string
+  LianlianPrivateKey: string
+  LianlianPlatformPublicCert: string
+  LianlianBusiType: string
+}
 
 type PaymentFormValues = z.infer<typeof paymentSchema>
 type WaffoFormFieldValues = Omit<WaffoSettingsValues, 'WaffoPayMethods'>
 type PaymentBaseFormValues = Omit<
   PaymentFormValues,
-  keyof WaffoFormFieldValues | keyof WaffoPancakeSettingsValues
+  | keyof WaffoFormFieldValues
+  | keyof WaffoPancakeSettingsValues
+  | keyof LianlianSettingsValues
 >
 
 const CURRENT_COMPLIANCE_TERMS_VERSION = 'v1'
+const DEFAULT_LIANLIAN_BUSI_TYPE = '100001'
 const paymentTabContentClassName = 'mt-6 min-w-0'
 
 type PaymentComplianceDefaults = {
@@ -200,6 +239,7 @@ type PaymentSettingsSectionProps = {
   defaultValues: PaymentBaseFormValues
   waffoDefaultValues: WaffoSettingsValues
   waffoPancakeDefaultValues: WaffoPancakeSettingsValues
+  lianlianDefaultValues: LianlianSettingsValues
   waffoPancakeProvisionedStoreID?: string
   waffoPancakeProvisionedProductID?: string
   complianceDefaults: PaymentComplianceDefaults
@@ -218,6 +258,7 @@ export function PaymentSettingsSection({
   defaultValues,
   waffoDefaultValues,
   waffoPancakeDefaultValues,
+  lianlianDefaultValues,
   waffoPancakeProvisionedStoreID,
   waffoPancakeProvisionedProductID,
   complianceDefaults,
@@ -230,8 +271,14 @@ export function PaymentSettingsSection({
       ...defaultValues,
       ...waffoDefaultValues,
       ...waffoPancakeDefaultValues,
+      ...lianlianDefaultValues,
     }),
-    [defaultValues, waffoDefaultValues, waffoPancakeDefaultValues]
+    [
+      defaultValues,
+      waffoDefaultValues,
+      waffoPancakeDefaultValues,
+      lianlianDefaultValues,
+    ]
   )
   const initialRef = React.useRef(initialFormValues)
   const defaultsSignature = React.useMemo(
@@ -458,6 +505,13 @@ export function PaymentSettingsSection({
       WaffoPancakeReturnURL: removeTrailingSlash(
         values.WaffoPancakeReturnURL.trim()
       ),
+      LianlianEnabled: values.LianlianEnabled,
+      LianlianEnv: values.LianlianEnv === 'prod' ? 'prod' : 'test',
+      LianlianGateway: removeTrailingSlash(values.LianlianGateway.trim()),
+      LianlianMchId: values.LianlianMchId.trim(),
+      LianlianPrivateKey: values.LianlianPrivateKey.trim(),
+      LianlianPlatformPublicCert: values.LianlianPlatformPublicCert.trim(),
+      LianlianBusiType: values.LianlianBusiType.trim() || '100001',
     }
 
     const initial = {
@@ -505,6 +559,16 @@ export function PaymentSettingsSection({
       WaffoPancakeReturnURL: removeTrailingSlash(
         initialRef.current.WaffoPancakeReturnURL.trim()
       ),
+      LianlianEnabled: initialRef.current.LianlianEnabled,
+      LianlianEnv: initialRef.current.LianlianEnv === 'prod' ? 'prod' : 'test',
+      LianlianGateway: removeTrailingSlash(
+        initialRef.current.LianlianGateway.trim()
+      ),
+      LianlianMchId: initialRef.current.LianlianMchId.trim(),
+      LianlianPrivateKey: initialRef.current.LianlianPrivateKey.trim(),
+      LianlianPlatformPublicCert:
+        initialRef.current.LianlianPlatformPublicCert.trim(),
+      LianlianBusiType: initialRef.current.LianlianBusiType.trim() || '100001',
     }
 
     const updates: Array<{ key: string; value: string | number | boolean }> = []
@@ -702,6 +766,50 @@ export function PaymentSettingsSection({
       updates.push({ key: 'WaffoPayMethods', value: sanitized.WaffoPayMethods })
     }
 
+    if (sanitized.LianlianEnabled !== initial.LianlianEnabled) {
+      updates.push({ key: 'LianlianEnabled', value: sanitized.LianlianEnabled })
+    }
+
+    if (sanitized.LianlianEnv !== initial.LianlianEnv) {
+      updates.push({ key: 'LianlianEnv', value: sanitized.LianlianEnv })
+    }
+
+    if (sanitized.LianlianGateway !== initial.LianlianGateway) {
+      updates.push({ key: 'LianlianGateway', value: sanitized.LianlianGateway })
+    }
+
+    if (sanitized.LianlianMchId !== initial.LianlianMchId) {
+      updates.push({ key: 'LianlianMchId', value: sanitized.LianlianMchId })
+    }
+
+    // Secrets are write-only: the API never returns them, so an empty field
+    // means "keep the stored value".
+    if (sanitized.LianlianPrivateKey) {
+      updates.push({
+        key: 'LianlianPrivateKey',
+        value: sanitized.LianlianPrivateKey,
+      })
+    }
+
+    // The platform key is a public certificate, so it is returned by the API
+    // and clearing the field restores the bundled official key.
+    if (
+      sanitized.LianlianPlatformPublicCert !==
+      initial.LianlianPlatformPublicCert
+    ) {
+      updates.push({
+        key: 'LianlianPlatformPublicCert',
+        value: sanitized.LianlianPlatformPublicCert,
+      })
+    }
+
+    if (sanitized.LianlianBusiType !== initial.LianlianBusiType) {
+      updates.push({
+        key: 'LianlianBusiType',
+        value: sanitized.LianlianBusiType,
+      })
+    }
+
     const hasWaffoPancakeChanges =
       sanitized.WaffoPancakeMerchantID !== initial.WaffoPancakeMerchantID ||
       sanitized.WaffoPancakePrivateKey.length > 0 ||
@@ -879,11 +987,12 @@ export function PaymentSettingsSection({
           />
           <Tabs defaultValue='general' className='min-w-0'>
             <div className='overflow-x-auto pb-1'>
-              <TabsList className='grid min-w-[44rem] grid-cols-6'>
+              <TabsList className='grid min-w-[52rem] grid-cols-7'>
                 <TabsTrigger value='general'>{t('General')}</TabsTrigger>
                 <TabsTrigger value='epay'>Epay</TabsTrigger>
                 <TabsTrigger value='stripe'>{t('Stripe')}</TabsTrigger>
                 <TabsTrigger value='creem'>Creem</TabsTrigger>
+                <TabsTrigger value='lianlian'>LianLian</TabsTrigger>
                 <TabsTrigger value='waffo-pancake'>Waffo Pancake</TabsTrigger>
                 <TabsTrigger value='waffo'>Waffo</TabsTrigger>
               </TabsList>
@@ -1603,6 +1712,244 @@ export function PaymentSettingsSection({
                     </FormItem>
                   )}
                 />
+              </div>
+            </TabsContent>
+
+            <TabsContent
+              value='lianlian'
+              className={paymentTabContentClassName}
+            >
+              <div className='space-y-4'>
+                <div>
+                  <h3 className='text-lg font-medium'>
+                    {t('LianLian Gateway')}
+                  </h3>
+                  <p className='text-muted-foreground text-sm'>
+                    {t(
+                      'Native Alipay and WeChat scan-code payments through LianLian acquiring.'
+                    )}
+                  </p>
+                </div>
+
+                <div className='rounded-md bg-blue-50 p-4 text-sm text-blue-900 dark:bg-blue-950 dark:text-blue-100'>
+                  <p className='mb-2 font-medium'>
+                    {t('Webhook Configuration:')}
+                  </p>
+                  <ul className='list-inside list-disc space-y-1'>
+                    <li>
+                      {t('Webhook URL:')}{' '}
+                      <code className='rounded bg-blue-100 px-1 py-0.5 text-xs dark:bg-blue-900'>
+                        {'<ServerAddress>/api/user/lianlian/notify'}
+                      </code>
+                    </li>
+                    <li>
+                      {t(
+                        'Register this notify URL in the LianLian merchant portal. The platform public key is bundled, so only replace it when LianLian rotates the key.'
+                      )}
+                    </li>
+                  </ul>
+                </div>
+
+                <FormField
+                  control={form.control}
+                  name='LianlianEnabled'
+                  render={({ field }) => (
+                    <FormItem>
+                      <SettingsSwitchItem>
+                        <SettingsSwitchContent>
+                          <FormLabel>{t('Enable LianLian')}</FormLabel>
+                          <FormDescription>
+                            {t(
+                              'Show Alipay and WeChat scan-code top-up in the wallet'
+                            )}
+                          </FormDescription>
+                        </SettingsSwitchContent>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                      </SettingsSwitchItem>
+                    </FormItem>
+                  )}
+                />
+
+                <div className='grid gap-6 md:grid-cols-2'>
+                  <FormField
+                    control={form.control}
+                    name='LianlianEnv'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Environment')}</FormLabel>
+                        <Select
+                          items={[
+                            { value: 'test', label: t('Sandbox') },
+                            { value: 'prod', label: t('Production') },
+                          ]}
+                          value={field.value === 'prod' ? 'prod' : 'test'}
+                          onValueChange={field.onChange}
+                        >
+                          <FormControl>
+                            <SelectTrigger>
+                              <SelectValue placeholder={t('Sandbox')} />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent alignItemWithTrigger={false}>
+                            <SelectGroup>
+                              <SelectItem value='test'>
+                                {t('Sandbox')}
+                              </SelectItem>
+                              <SelectItem value='prod'>
+                                {t('Production')}
+                              </SelectItem>
+                            </SelectGroup>
+                          </SelectContent>
+                        </Select>
+                        <FormDescription>
+                          {t('Selects the default LianLian gateway')}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name='LianlianBusiType'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Business type')}</FormLabel>
+                        <FormControl>
+                          <Input
+                            placeholder={DEFAULT_LIANLIAN_BUSI_TYPE}
+                            {...field}
+                            onChange={(event) =>
+                              field.onChange(event.target.value)
+                            }
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {t(
+                            'LianLian busi_type, leave blank for the default ordinary acquiring (100001)'
+                          )}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+
+                <div className='grid gap-6 md:grid-cols-2'>
+                  <FormField
+                    control={form.control}
+                    name='LianlianMchId'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Merchant ID')}</FormLabel>
+                        <FormControl>
+                          <Input
+                            placeholder='2020042200284052'
+                            autoComplete='off'
+                            {...field}
+                            onChange={(event) =>
+                              field.onChange(event.target.value)
+                            }
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+
+                <FormField
+                  control={form.control}
+                  name='LianlianGateway'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('Custom gateway')}</FormLabel>
+                      <FormControl>
+                        <Input
+                          placeholder={t(
+                            'Leave blank to use the official LianLian gateway'
+                          )}
+                          {...field}
+                          onChange={(event) =>
+                            field.onChange(event.target.value)
+                          }
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'Optional LianLian gateway base URL. It must end with /mch, e.g. https://openapi-test2.lianlianpay-inc.com/mch (test) or https://openapi.lianlianpay.com/mch (production); the create-order path is appended automatically.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <div className='grid gap-6 md:grid-cols-2'>
+                  <FormField
+                    control={form.control}
+                    name='LianlianPrivateKey'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Merchant RSA private key')}</FormLabel>
+                        <FormControl>
+                          <Textarea
+                            rows={4}
+                            placeholder='-----BEGIN RSA PRIVATE KEY-----'
+                            autoComplete='new-password'
+                            className='font-mono text-xs'
+                            {...field}
+                            onChange={(event) =>
+                              field.onChange(event.target.value)
+                            }
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {t(
+                            'PEM encoded private key used to sign create-order requests. Leave blank unless rotating the key.'
+                          )}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name='LianlianPlatformPublicCert'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>
+                          {t('LianLian platform public key')}
+                        </FormLabel>
+                        <FormControl>
+                          <Textarea
+                            rows={4}
+                            placeholder={t(
+                              'Leave blank to use the bundled key'
+                            )}
+                            className='font-mono text-xs'
+                            {...field}
+                            onChange={(event) =>
+                              field.onChange(event.target.value)
+                            }
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {t(
+                            'PEM public key used to verify payment notifications. The official key is bundled.'
+                          )}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
               </div>
             </TabsContent>
 

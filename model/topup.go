@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -19,6 +20,7 @@ type TopUp struct {
 	UserId          int     `json:"user_id" gorm:"index"`
 	Amount          int64   `json:"amount"`
 	Money           float64 `json:"money"`
+	ProviderTradeNo string  `json:"provider_trade_no" gorm:"type:varchar(128);index;default:''"`
 	TradeNo         string  `json:"trade_no" gorm:"unique;type:varchar(255);index"`
 	PaymentMethod   string  `json:"payment_method" gorm:"type:varchar(50)"`
 	PaymentProvider string  `json:"payment_provider" gorm:"type:varchar(50);default:''"`
@@ -41,6 +43,7 @@ const (
 	PaymentProviderCreem        = "creem"
 	PaymentProviderWaffo        = "waffo"
 	PaymentProviderWaffoPancake = "waffo_pancake"
+	PaymentProviderLianlian     = "lianlian"
 	PaymentProviderBalance      = "balance"
 )
 
@@ -144,6 +147,63 @@ func GetTopUpByTradeNo(tradeNo string) *TopUp {
 	return topUp
 }
 
+// UpdateTopUpProviderTradeNo records an upstream transaction number without
+// overwriting payment state. A callback may complete the order while the
+// create-payment response is still in flight.
+func UpdateTopUpProviderTradeNo(tradeNo string, providerTradeNo string) error {
+	providerTradeNo = strings.TrimSpace(providerTradeNo)
+	if tradeNo == "" || providerTradeNo == "" {
+		return nil
+	}
+	result := DB.Model(&TopUp{}).
+		Where("trade_no = ? AND (provider_trade_no = '' OR provider_trade_no = ?)", tradeNo, providerTradeNo).
+		Update("provider_trade_no", providerTradeNo)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 1 {
+		return nil
+	}
+
+	var topUp TopUp
+	if err := DB.Select("provider_trade_no").Where("trade_no = ?", tradeNo).First(&topUp).Error; err != nil {
+		return ErrTopUpNotFound
+	}
+	if topUp.ProviderTradeNo != providerTradeNo {
+		return ErrLianlianProviderTradeNoMismatch
+	}
+	return nil
+}
+
+// FindPendingTopUpsByProvider returns pending orders old enough for an
+// upstream status check. The lower bound keeps reconciliation from scanning
+// indefinitely old rows.
+func FindPendingTopUpsByProvider(provider string, createdBefore int64, createdAfter int64, limit int) ([]TopUp, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := DB.Where("payment_provider = ? AND status = ? AND create_time <= ?",
+		provider, common.TopUpStatusPending, createdBefore)
+	if createdAfter > 0 {
+		query = query.Where("create_time > ?", createdAfter)
+	}
+	var topUps []TopUp
+	err := query.Order("id asc").Limit(limit).Find(&topUps).Error
+	return topUps, err
+}
+
+func HasPendingTopUpsByProvider(provider string, createdBefore int64, createdAfter int64) (bool, error) {
+	var topUp TopUp
+	query := DB.Select("id").
+		Where("payment_provider = ? AND status = ? AND create_time <= ?",
+			provider, common.TopUpStatusPending, createdBefore)
+	if createdAfter > 0 {
+		query = query.Where("create_time > ?", createdAfter)
+	}
+	err := query.Limit(1).Find(&topUp).Error
+	return topUp.Id > 0, err
+}
+
 func UpdatePendingTopUpStatus(tradeNo string, expectedPaymentProvider string, targetStatus string) error {
 	if tradeNo == "" {
 		return errors.New("未提供支付单号")
@@ -237,6 +297,97 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string, p
 
 	common.SysLog(fmt.Sprintf("易支付充值成功 trade_no=%s user_id=%d quota_to_add=%d money=%.2f", topUp.TradeNo, topUp.UserId, quotaToAdd, topUp.Money))
 	RecordTopupLog(topUp.UserId, fmt.Sprintf("使用在线充值成功，充值金额: %v，支付金额：%f", logger.LogQuota(quotaToAdd), topUp.Money), callerIp, topUp.PaymentMethod, PaymentProviderEpay)
+	return false, nil
+}
+
+var (
+	// ErrLianlianAmountMismatch 表示连连回调金额与订单金额不一致，拒绝入账。
+	ErrLianlianAmountMismatch = errors.New("lianlian payment amount mismatch")
+	// ErrLianlianProviderTradeNoMismatch 表示同一商户订单对应了不同的上游流水号。
+	ErrLianlianProviderTradeNoMismatch = errors.New("lianlian provider trade number mismatch")
+)
+
+// RechargeLianlian 原子完成连连订单。到账额度沿用平台既有的
+// Amount × QuotaPerUnit 口径，与易支付等渠道保持相同充值语义。
+func RechargeLianlian(tradeNo string, actualPaymentMethod string, callerIp string, paidAmount string, providerTradeNo string) (alreadyDone bool, err error) {
+	if tradeNo == "" {
+		return false, errors.New("未提供支付单号")
+	}
+
+	refCol := "`trade_no`"
+	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
+		refCol = `"trade_no"`
+	}
+
+	var quotaToAdd int
+	topUp := &TopUp{}
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(topUp).Error; err != nil {
+			return ErrTopUpNotFound
+		}
+		if topUp.PaymentProvider != PaymentProviderLianlian {
+			return ErrPaymentMethodMismatch
+		}
+		expectedMoney := decimal.NewFromFloat(topUp.Money).Round(2)
+		paid, amountErr := decimal.NewFromString(paidAmount)
+		if amountErr != nil || !expectedMoney.IsPositive() || !paid.Equal(expectedMoney) || !paid.IsPositive() {
+			return ErrLianlianAmountMismatch
+		}
+
+		providerTradeNo = strings.TrimSpace(providerTradeNo)
+		if providerTradeNo != "" {
+			if len(providerTradeNo) > 128 ||
+				(topUp.ProviderTradeNo != "" && topUp.ProviderTradeNo != providerTradeNo) {
+				return ErrLianlianProviderTradeNoMismatch
+			}
+			topUp.ProviderTradeNo = providerTradeNo
+		}
+		if topUp.Status == common.TopUpStatusSuccess {
+			if providerTradeNo != "" {
+				if err := tx.Model(topUp).Update("provider_trade_no", providerTradeNo).Error; err != nil {
+					return err
+				}
+			}
+			alreadyDone = true
+			return nil
+		}
+		if topUp.Status != common.TopUpStatusPending {
+			return ErrTopUpStatusInvalid
+		}
+		if actualPaymentMethod != "" && topUp.PaymentMethod != actualPaymentMethod {
+			return ErrPaymentMethodMismatch
+		}
+		var quotaErr error
+		quotaToAdd, quotaErr = common.WalletQuotaFromDecimalStrict(
+			decimal.NewFromInt(topUp.Amount).Mul(decimal.NewFromFloat(common.QuotaPerUnit)),
+		)
+		if quotaErr != nil || quotaToAdd <= 0 {
+			return ErrInvalidTopUpQuota
+		}
+		topUp.CompleteTime = common.GetTimestamp()
+		topUp.Status = common.TopUpStatusSuccess
+		if err := tx.Save(topUp).Error; err != nil {
+			return err
+		}
+		return creditTopUpQuota(tx, topUp.UserId, quotaToAdd, nil)
+	})
+	if err != nil {
+		if !errors.Is(err, ErrTopUpNotFound) &&
+			!errors.Is(err, ErrPaymentMethodMismatch) &&
+			!errors.Is(err, ErrTopUpStatusInvalid) &&
+			!errors.Is(err, ErrLianlianAmountMismatch) &&
+			!errors.Is(err, ErrLianlianProviderTradeNoMismatch) {
+			common.SysError("lianlian topup failed: " + err.Error())
+		}
+		return false, err
+	}
+	if alreadyDone {
+		return true, nil
+	}
+	syncCreditUserQuotaCache(topUp.UserId, quotaToAdd, "lianlian topup")
+
+	common.SysLog(fmt.Sprintf("连连充值成功 trade_no=%s user_id=%d quota_to_add=%d money=%.2f", topUp.TradeNo, topUp.UserId, quotaToAdd, topUp.Money))
+	RecordTopupLog(topUp.UserId, fmt.Sprintf("使用连连支付充值成功，充值金额: %v，支付金额：%f", logger.LogQuota(quotaToAdd), topUp.Money), callerIp, topUp.PaymentMethod, PaymentProviderLianlian)
 	return false, nil
 }
 

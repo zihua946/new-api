@@ -56,6 +56,21 @@ type migrationDecimalV3 struct {
 	Price float64 `gorm:"type:decimal(12,6);not null;default:1.25"`
 }
 
+type migrationTopUpV1 struct {
+	Id              int `gorm:"primaryKey"`
+	UserId          int `gorm:"index"`
+	Amount          int64
+	Money           float64
+	TradeNo         string `gorm:"unique;type:varchar(255);index"`
+	PaymentMethod   string `gorm:"type:varchar(50)"`
+	PaymentProvider string `gorm:"type:varchar(50);default:''"`
+	CreateTime      int64
+	CompleteTime    int64
+	Status          string
+	BillingUnitId   int `gorm:"index;default:0"`
+	OperatorUserId  int `gorm:"index;default:0"`
+}
+
 func TestMigrationSchemaStability(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {
@@ -139,6 +154,65 @@ func TestMigrationSchemaStability(t *testing.T) {
 				assert.Empty(t, recorder.schemaMutations())
 				require.NoError(t, db.Table(table).AutoMigrate(&migrationConstraintV1{}))
 				require.NoError(t, db.Table(table).Create(&migrationConstraintV1{Name: "existing"}).Error)
+			})
+
+			t.Run("topup_payment_tracking_columns", func(t *testing.T) {
+				const table = "migration_topup_test"
+				t.Cleanup(func() { _ = db.Migrator().DropTable(table) })
+				require.NoError(t, db.Table(table).AutoMigrate(&migrationTopUpV1{}))
+				require.NoError(t, db.Table(table).Create(&migrationTopUpV1{
+					Id:              1,
+					UserId:          7,
+					Amount:          10,
+					Money:           73.05,
+					TradeNo:         "legacy-topup",
+					PaymentMethod:   "alipay",
+					PaymentProvider: "epay",
+					Status:          common.TopUpStatusSuccess,
+				}).Error)
+
+				require.NoError(t, db.Table(table).AutoMigrate(&TopUp{}))
+				recorder.reset()
+				require.NoError(t, db.Table(table).AutoMigrate(&TopUp{}))
+				assert.Empty(t, recorder.schemaMutations())
+
+				assert.False(t, db.Table(table).Migrator().HasColumn(&TopUp{}, "money_cents"))
+				assert.True(t, db.Table(table).Migrator().HasColumn(&TopUp{}, "provider_trade_no"))
+				assert.True(t, db.Table(table).Migrator().HasIndex(&TopUp{}, "ProviderTradeNo"))
+
+				var legacy TopUp
+				require.NoError(t, db.Table(table).First(&legacy, 1).Error)
+				assert.Empty(t, legacy.ProviderTradeNo)
+				assert.InDelta(t, 73.05, legacy.Money, 1e-9)
+
+				tracked := TopUp{
+					Id:              2,
+					UserId:          7,
+					Amount:          10,
+					Money:           73.05,
+					ProviderTradeNo: "LL20261021001",
+					TradeNo:         "tracked-topup",
+					PaymentMethod:   "alipay",
+					PaymentProvider: "lianlian",
+					Status:          common.TopUpStatusPending,
+				}
+				require.NoError(t, db.Table(table).Create(&tracked).Error)
+				var saved TopUp
+				require.NoError(t, db.Table(table).Where("trade_no = ?", tracked.TradeNo).First(&saved).Error)
+				assert.Equal(t, tracked.ProviderTradeNo, saved.ProviderTradeNo)
+
+				const freshTable = "migration_topup_fresh_test"
+				t.Cleanup(func() { _ = db.Migrator().DropTable(freshTable) })
+				require.NoError(t, db.Table(freshTable).AutoMigrate(&TopUp{}))
+				recorder.reset()
+				require.NoError(t, db.Table(freshTable).AutoMigrate(&TopUp{}))
+				assert.Empty(t, recorder.schemaMutations())
+				assert.False(t, db.Table(freshTable).Migrator().HasColumn(&TopUp{}, "money_cents"))
+				require.NoError(t, db.Table(freshTable).Create(&tracked).Error)
+				var freshSaved TopUp
+				require.NoError(t, db.Table(freshTable).Where("trade_no = ?", tracked.TradeNo).First(&freshSaved).Error)
+				assert.Equal(t, tracked.Money, freshSaved.Money)
+				assert.Equal(t, tracked.ProviderTradeNo, freshSaved.ProviderTradeNo)
 			})
 
 			if dialect == "mysql" {

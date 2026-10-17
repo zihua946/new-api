@@ -167,3 +167,30 @@ func TestEpayWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	operation_setting.PayMethods = nil
 	require.False(t, isEpayWebhookEnabled())
 }
+
+func TestLianlianWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+	confirmPaymentComplianceForTest(t)
+	originalEnabled := setting.LianlianEnabled
+	originalMchID := setting.LianlianMchId
+	originalPrivateKey := setting.LianlianPrivateKey
+	t.Cleanup(func() {
+		setting.LianlianEnabled = originalEnabled
+		setting.LianlianMchId = originalMchID
+		setting.LianlianPrivateKey = originalPrivateKey
+	})
+
+	setting.LianlianEnabled = true
+	setting.LianlianMchId = "2020042200284052"
+	setting.LianlianPrivateKey = ""
+	require.False(t, isLianlianWebhookEnabled())
+
+	setting.LianlianPrivateKey = "-----BEGIN RSA PRIVATE KEY-----"
+	require.True(t, isLianlianWebhookEnabled())
+
+	setting.LianlianEnabled = false
+	require.False(t, isLianlianWebhookEnabled())
+
+	setting.LianlianEnabled = true
+	setting.LianlianMchId = "   "
+	require.False(t, isLianlianWebhookEnabled())
+}

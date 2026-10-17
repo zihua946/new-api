@@ -96,7 +96,9 @@ func GetTopUpInfo(c *gin.Context) {
 		}
 	}
 
+	enableLianlian := isLianlianTopUpEnabled()
 	data := gin.H{
+		"enable_lianlian_topup":            enableLianlian,
 		"enable_online_topup":              isEpayTopUpEnabled(),
 		"enable_stripe_topup":              isStripeTopUpEnabled(),
 		"enable_creem_topup":               isCreemTopUpEnabled(),
@@ -105,6 +107,12 @@ func GetTopUpInfo(c *gin.Context) {
 		"enable_redemption":                complianceConfirmed,
 		"payment_compliance_confirmed":     complianceConfirmed,
 		"payment_compliance_terms_version": operation_setting.CurrentComplianceTermsVersion,
+		"lianlian_pay_methods": func() any {
+			if enableLianlian {
+				return lianlianPayMethods()
+			}
+			return nil
+		}(),
 		"waffo_pay_methods": func() any {
 			if enableWaffo {
 				return setting.GetWaffoPayMethods()
