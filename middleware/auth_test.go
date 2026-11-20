@@ -31,7 +31,7 @@ func setupDashboardAuthMiddlewareTest(t *testing.T) {
 	previousSecret := common.SessionSecret
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.AuditLog{}))
+	require.NoError(t, db.AutoMigrate(&model.QuotaOperation{}, &model.User{}, &model.UserSession{}, &model.AuditLog{}))
 	model.DB = db
 	model.LOG_DB = db
 	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
@@ -271,7 +271,7 @@ func TestTeamBillingIdentityIndependentOfEndpoint(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	require.NoError(t, model.DB.AutoMigrate(&model.User{}))
-	require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.BillingUnit{}, &model.BillingUnitMember{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.QuotaOperation{}, &model.Token{}, &model.BillingUnit{}, &model.BillingUnitMember{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}))
 	for _, u := range []model.User{{Id: 501, Username: "team-consumer", AffCode: "consumer", Status: common.UserStatusEnabled}, {Id: 502, Username: "team-payer", AffCode: "payer", Quota: 10000, Status: common.UserStatusEnabled}} {
 		require.NoError(t, model.DB.Create(&u).Error)
 	}

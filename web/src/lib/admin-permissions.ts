@@ -27,6 +27,7 @@ export const ADMIN_PERMISSION_RESOURCES = {
   AUDIT: 'audit',
   CHANNEL: 'channel',
   TASK_PLUGIN: 'task_plugin',
+  MCP: 'mcp',
 } as const
 
 export const ADMIN_PERMISSION_ACTIONS = {

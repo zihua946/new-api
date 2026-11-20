@@ -3,6 +3,7 @@
 *.md
 .vscode
 .gitignore
+.env
 Makefile
 docs
 .eslintcache

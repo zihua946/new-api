@@ -336,6 +336,7 @@ func migrateDB() error {
 
 	err := DB.AutoMigrate(
 		&Channel{},
+		&QuotaOperation{},
 		&Token{},
 		&User{},
 		&UserSession{},
@@ -380,6 +381,9 @@ func migrateDB() error {
 	if err := InitializeUserAuthVersions(); err != nil {
 		return err
 	}
+	if err := MigrateMCP(DB); err != nil {
+		return err
+	}
 	if err := InitializeExternalIdentityClaims(); err != nil {
 		return err
 	}
@@ -408,6 +412,9 @@ func migrateLOGDB() error {
 func migrateClickHouseLogDB() error {
 	ttlDays := clickHouseLogTTLDays()
 	if err := LOG_DB.Exec(clickHouseLogCreateTableSQL(ttlDays)).Error; err != nil {
+		return err
+	}
+	if err := LOG_DB.Exec("ALTER TABLE logs ADD COLUMN IF NOT EXISTS billing_user_id Int64 DEFAULT 0, ADD COLUMN IF NOT EXISTS billing_unit_id Int64 DEFAULT 0").Error; err != nil {
 		return err
 	}
 	return syncClickHouseLogTTL(ttlDays)
@@ -441,6 +448,8 @@ func clickHouseLogCreateTableSQL(ttlDays int) string {
 CREATE TABLE IF NOT EXISTS logs (
 	id Int64 DEFAULT 0,
 	user_id Int32 DEFAULT 0,
+	billing_user_id Int64 DEFAULT 0,
+	billing_unit_id Int64 DEFAULT 0,
 	created_at Int64 DEFAULT 0,
 	type Int32 DEFAULT 0,
 	content String DEFAULT '',

@@ -75,11 +75,11 @@ func AdjustUserQuota(userID, operatorRole int, mode string, value int) (*UserQuo
 		return nil, err
 	}
 
-	// Apply only the committed difference, preserving outstanding reservations.
+	// Invalidate the committed balance; hydration may already contain this change.
 	// Both balances are bounded above, so their difference fits in int64.
 	delta := int64(adjustment.After) - int64(adjustment.Before)
 	if delta != 0 {
-		if err := cacheIncrUserQuota(userID, delta); err != nil {
+		if err := invalidateUserCache(userID); err != nil {
 			common.SysError(fmt.Sprintf("failed to sync manual quota adjustment for user %d: %s", userID, err))
 		}
 	}

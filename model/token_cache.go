@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
 )
 
 func getTokenCacheKey(key string) string {
@@ -47,13 +48,26 @@ func invalidateTokenCacheForMutation(key string) error {
 	return common.RDB.Del(ctx, getTokenCacheKey(key)).Err()
 }
 
-// cacheInitToken publishes a database snapshot only when no mutation fence is
-// active and the hash is cold. An existing hash only gets its TTL refreshed:
-// its RemainQuota may already be ahead of this snapshot because atomic
-// pre-consume decrements Redis first, so a snapshot must never overwrite any
-// field of a live hash.
-// 返回值：0=被 fence 拦截，1=完成初始化，2=哈希已存在，仅刷新 TTL。
+// cacheInitToken re-reads under the same lock as quota mutations, so a stale
+// snapshot cannot be published after a debit commits. Authentication mutation
+// fences still take precedence over hydration.
 func cacheInitToken(token Token) (int, error) {
+	if !common.RedisEnabled {
+		return 0, nil
+	}
+	var result int
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		current, err := lockQuotaToken(tx, token.Id, false)
+		if err != nil {
+			return err
+		}
+		result, err = writeTokenCache(*current)
+		return err
+	})
+	return result, err
+}
+
+func writeTokenCache(token Token) (int, error) {
 	if !common.RedisEnabled {
 		return 0, nil
 	}

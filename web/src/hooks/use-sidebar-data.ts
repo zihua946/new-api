@@ -1,3 +1,4 @@
+import { useQuery } from '@tanstack/react-query'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -40,7 +41,10 @@ import {
 import { useTranslation } from 'react-i18next'
 
 import type { SidebarData } from '@/components/layout/types'
+import { hasPermission } from '@/lib/admin-permissions'
 import { ROLE } from '@/lib/roles'
+import { statusQueryOptions } from '@/lib/status-query'
+import { useAuthStore } from '@/stores/auth-store'
 
 /**
  * Root navigation groups for the application sidebar.
@@ -50,6 +54,8 @@ import { ROLE } from '@/lib/roles'
  */
 export function useSidebarData(): SidebarData {
   const { t } = useTranslation()
+  const status = useQuery(statusQueryOptions)
+  const user = useAuthStore((state) => state.auth.user)
 
   return {
     navGroups: [
@@ -111,6 +117,15 @@ export function useSidebarData(): SidebarData {
         id: 'personal',
         title: t('Personal'),
         items: [
+          ...(status.data?.mcp_enabled === true
+            ? [
+                {
+                  title: t('MCP Marketplace'),
+                  url: '/mcp-marketplace' as const,
+                  icon: PlugZap,
+                },
+              ]
+            : []),
           {
             title: t('Wallet'),
             url: '/wallet',
@@ -132,6 +147,17 @@ export function useSidebarData(): SidebarData {
         id: 'admin',
         title: t('Admin'),
         items: [
+          ...(status.data?.mcp_enabled === true &&
+          hasPermission(user, 'mcp', 'read')
+            ? [
+                {
+                  title: t('MCP Services'),
+                  url: '/mcp' as const,
+                  icon: PlugZap,
+                  requiredRole: ROLE.ADMIN,
+                },
+              ]
+            : []),
           {
             title: t('Channels'),
             url: '/channels',

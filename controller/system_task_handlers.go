@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	mcpsvc "github.com/QuantumNous/new-api/service/mcp"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 )
 
@@ -23,6 +24,53 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
 	service.RegisterSystemTaskHandler(lianlianReconcileHandler{})
+	service.RegisterSystemTaskHandler(mcpReconcileHandler{})
+	service.RegisterSystemTaskHandler(quotaReconcileHandler{})
+}
+
+type quotaReconcileHandler struct{}
+
+func (quotaReconcileHandler) Type() string { return "quota_reconcile" }
+func (quotaReconcileHandler) Enabled() bool {
+	var count int64
+	return model.DB.Model(&model.QuotaOperation{}).Where("state = ?", "pending").Limit(1).Count(&count).Error == nil && count > 0
+}
+func (quotaReconcileHandler) Interval() time.Duration { return 15 * time.Second }
+func (quotaReconcileHandler) NewPayload() any         { return nil }
+func (quotaReconcileHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	count, err := model.RecoverQuotaOperations(ctx, time.Now().UTC())
+	status := model.SystemTaskStatusSucceeded
+	if err != nil {
+		status = model.SystemTaskStatusFailed
+	}
+	finishSystemTaskHandler(task, runnerID, status, map[string]any{"reconciled": count}, err)
+}
+
+type mcpReconcileHandler struct{}
+
+func (mcpReconcileHandler) Type() string { return "mcp_reconcile" }
+func (mcpReconcileHandler) Enabled() bool {
+	// Recovery remains enabled after the public MCP feature gate is closed.
+	var count int64
+	if model.DB.Model(&model.MCPInvocation{}).Where("receipt_state = ? OR billing_status IN ? OR status IN ? OR (result_expires_at <= ? AND result_ciphertext <> ?)", "pending", []string{"reserving", "reserved", "refund_pending", "reconciliation_pending"}, []string{"accepted", "running"}, time.Now().UTC(), "").Limit(1).Count(&count).Error == nil && count > 0 {
+		return true
+	}
+	for _, table := range []any{&model.MCPDiscovery{}, &model.MCPTestAuthorization{}, &model.MCPAuthorizationFlow{}} {
+		if model.DB.Model(table).Where("expires_at <= ?", time.Now().UTC()).Limit(1).Count(&count).Error == nil && count > 0 {
+			return true
+		}
+	}
+	return model.DB.Model(&model.MCPChatTest{}).Where("expires_at <= ? AND result <> ?", time.Now().UTC(), "").Limit(1).Count(&count).Error == nil && count > 0
+}
+func (mcpReconcileHandler) Interval() time.Duration { return 15 * time.Second }
+func (mcpReconcileHandler) NewPayload() any         { return nil }
+func (mcpReconcileHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	count, err := mcpsvc.Recover(ctx)
+	status := model.SystemTaskStatusSucceeded
+	if err != nil {
+		status = model.SystemTaskStatusFailed
+	}
+	finishSystemTaskHandler(task, runnerID, status, map[string]any{"reconciled": count}, err)
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and

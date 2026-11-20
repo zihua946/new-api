@@ -96,6 +96,21 @@ api.interceptors.response.use(
     const skipErrorHandler = config?.skipErrorHandler
     const status = error?.response?.status
 
+    // Tool consent belongs to the upstream service. The dashboard session is still valid.
+    if (
+      status === 401 &&
+      config?.url?.startsWith('/api/mcp/') &&
+      [
+        'ENGINE_AUTHORIZATION_REQUIRED',
+        'REAUTHORIZATION_REQUIRED',
+        'TEST_AUTHORIZATION_REQUIRED',
+        'OAUTH_CLIENT_REGISTRATION_REQUIRED',
+        'AUTHORIZATION_FAILED',
+        'AUTHORIZATION_REVOKED',
+      ].includes(error.response?.data?.code)
+    ) {
+      throw error
+    }
     if (status === 401) {
       if (config && !config.skipAuthRefresh && !config.authRetry) {
         config.authRetry = true

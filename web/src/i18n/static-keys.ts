@@ -19,6 +19,10 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  'View MCP services and usage',
+  'Edit MCP service descriptions',
+  'Operate and test MCP services',
+  'Edit MCP connections, credentials and prices',
   // Billing expression simulation diagnostics and conditional labels.
   '{{start}}–{{end}}',
 

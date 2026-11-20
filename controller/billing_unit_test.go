@@ -76,7 +76,7 @@ func TestBillingUnitAPIAndSettlement(t *testing.T) {
 			t.Log("database", version)
 			require.NoError(t, db.AutoMigrate(&legacyIntegrationBinding{}))
 			require.NoError(t, db.Create(&legacyIntegrationBinding{Id: 100, UserId: 2, ProviderId: 1, ProviderUserId: "bound-before-upgrade"}).Error)
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserOAuthBinding{}, &model.CustomOAuthProvider{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}))
+			require.NoError(t, db.AutoMigrate(&model.QuotaOperation{}, &model.User{}, &model.Token{}, &model.UserOAuthBinding{}, &model.CustomOAuthProvider{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}))
 			require.NoError(t, logDB.AutoMigrate(&legacyBillingLog{}))
 			require.NoError(t, logDB.Create(&legacyBillingLog{UserId: 2, Quota: 17}).Error)
 			for range 2 {

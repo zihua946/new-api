@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -392,6 +393,13 @@ func usageSemanticFromUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) 
 	return "openai"
 }
 
+type textSettlementObserverKey struct{}
+
+// ObserveTextSettlement reports the actual outcome of a single in-process relay request.
+func ObserveTextSettlement(ctx context.Context, settled func(quota int, err error)) context.Context {
+	return context.WithValue(ctx, textSettlementObserverKey{}, settled)
+}
+
 func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []string) {
 	originUsage := usage
 	billingUsage := effectiveBillingUsage(usage)
@@ -460,8 +468,14 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, summary.Quota)
 	}
 
-	if err := SettleBilling(ctx, relayInfo, summary.Quota); err != nil {
-		logger.LogError(ctx, "error settling billing: "+err.Error())
+	settlementErr := SettleBilling(ctx, relayInfo, summary.Quota)
+	if settlementErr != nil {
+		logger.LogError(ctx, "error settling billing: "+settlementErr.Error())
+	}
+	if ctx.Request != nil {
+		if settled, ok := ctx.Request.Context().Value(textSettlementObserverKey{}).(func(int, error)); ok {
+			settled(summary.Quota, settlementErr)
+		}
 	}
 
 	logModel := summary.ModelName

@@ -103,7 +103,7 @@ func TestBillingTeamSelfService(t *testing.T) {
 			order := legacyTeamTopup{UserId: 998, Amount: 3, Money: 3, TradeNo: "legacy", Status: common.TopUpStatusSuccess}
 			require.NoError(t, db.Create(&order).Error)
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.BillingUnit{}, &model.BillingUnitMember{}, &model.BillingUnitInvitation{}, &model.TopUp{}, &model.UserOAuthBinding{}, &model.CustomOAuthProvider{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}))
+				require.NoError(t, db.AutoMigrate(&model.QuotaOperation{}, &model.User{}, &model.Token{}, &model.BillingUnit{}, &model.BillingUnitMember{}, &model.BillingUnitInvitation{}, &model.TopUp{}, &model.UserOAuthBinding{}, &model.CustomOAuthProvider{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}))
 				require.NoError(t, logDB.AutoMigrate(&model.Log{}, &model.AuditLog{}))
 			}
 			var previous model.BillingUnit

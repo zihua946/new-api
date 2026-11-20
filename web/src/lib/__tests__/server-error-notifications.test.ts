@@ -368,6 +368,31 @@ it.each([200, 401])(
   }
 )
 
+it('keeps the dashboard session when an installed MCP service needs consent', async () => {
+  const send = vi.spyOn(XMLHttpRequest.prototype, 'send')
+  const adapter = vi.fn<AxiosAdapter>(async (config) => {
+    throw new AxiosError(
+      'Consent required',
+      'ERR_BAD_REQUEST',
+      config,
+      undefined,
+      {
+        data: { code: 'ENGINE_AUTHORIZATION_REQUIRED' },
+        status: 401,
+        statusText: 'Unauthorized',
+        headers: {},
+        config,
+      }
+    )
+  })
+  api.defaults.adapter = adapter
+  await expect(api.get('/api/mcp/self/servers/one/test-tools')).rejects.toThrow(
+    'Consent required'
+  )
+  expect(adapter).toHaveBeenCalledTimes(1)
+  expect(send).not.toHaveBeenCalled()
+})
+
 it('never refreshes or replays a failed single-use authorization request', async () => {
   useAuthStore.getState().auth.setBundle({
     access_token: 'access',

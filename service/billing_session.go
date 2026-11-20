@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/google/uuid"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
@@ -51,21 +52,24 @@ func (s *BillingSession) Settle(actualQuota int) error {
 		s.settled = true
 		return nil
 	}
+	var fundingErr error
 	// 1) 调整资金来源（仅在尚未提交时执行，防止重复调用）
 	if !s.fundingSettled {
 		if err := s.funding.Settle(delta); err != nil {
-			return err
+			var pending *model.QuotaOperationPending
+			if !errors.As(err, &pending) {
+				return err
+			}
+			// The durable adjustment owns completion. Do not refund its
+			// original reservation or submit a second settlement on retry.
+			fundingErr = err
 		}
 		s.fundingSettled = true
 	}
 	// 2) 调整令牌额度
 	var tokenErr error
 	if !s.relayInfo.IsPlayground {
-		if delta > 0 {
-			tokenErr = model.DecreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, delta)
-		} else {
-			tokenErr = model.IncreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, -delta)
-		}
+		tokenErr = model.AdjustQuotaWithID(uuid.NewString(), 0, s.relayInfo.TokenId, -delta)
 		if tokenErr != nil {
 			// 资金来源已提交，令牌调整失败只能记录日志；标记 settled 防止 Refund 误退资金
 			common.SysLog(fmt.Sprintf("error adjusting token quota after funding settled (userId=%d, tokenId=%d, delta=%d): %s",
@@ -77,7 +81,7 @@ func (s *BillingSession) Settle(actualQuota int) error {
 		s.relayInfo.SubscriptionPostDelta += int64(delta)
 	}
 	s.settled = true
-	return tokenErr
+	return errors.Join(fundingErr, tokenErr)
 }
 
 // Refund 退还所有预扣费，幂等安全，异步执行。
@@ -98,7 +102,6 @@ func (s *BillingSession) Refund(c *gin.Context) {
 
 	// 复制需要的值到闭包中
 	tokenId := s.relayInfo.TokenId
-	tokenKey := s.relayInfo.TokenKey
 	isPlayground := s.relayInfo.IsPlayground
 	tokenConsumed := s.tokenConsumed
 	extraReserved := s.extraReserved
@@ -117,7 +120,7 @@ func (s *BillingSession) Refund(c *gin.Context) {
 		}
 		// 2) 退还令牌额度
 		if tokenConsumed > 0 && !isPlayground {
-			if err := model.IncreaseTokenQuota(tokenId, tokenKey, tokenConsumed); err != nil {
+			if err := model.AdjustQuotaWithID(uuid.NewString(), 0, tokenId, tokenConsumed); err != nil {
 				common.SysLog("error refunding token quota: " + err.Error())
 			}
 		}
