@@ -25,19 +25,21 @@ export function toolParameters(schema?: Record<string, unknown>) {
   ) {
     return null
   }
-  return entries.map(([name, property]) => {
-    const spec: Parameter =
-      property && typeof property === 'object' ? property : {}
-    const types = Array.isArray(spec.type)
-      ? spec.type.filter((type) => type !== 'null')
-      : []
-    return {
-      name,
-      spec: types.length === 1 ? { ...spec, type: types[0] } : spec,
-      required:
-        Array.isArray(schema.required) && schema.required.includes(name),
-    }
-  })
+  return entries
+    .map(([name, property]) => {
+      const spec: Parameter =
+        property && typeof property === 'object' ? property : {}
+      const types = Array.isArray(spec.type)
+        ? spec.type.filter((type) => type !== 'null')
+        : []
+      return {
+        name,
+        spec: types.length === 1 ? { ...spec, type: types[0] } : spec,
+        required:
+          Array.isArray(schema.required) && schema.required.includes(name),
+      }
+    })
+    .sort((a, b) => Number(b.required) - Number(a.required))
 }
 
 export type Fields = NonNullable<ReturnType<typeof toolParameters>>

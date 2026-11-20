@@ -30,6 +30,7 @@ import {
   AccordionContent,
 } from '@/components/ui/accordion'
 import { Button } from '@/components/ui/button'
+import { Spinner } from '@/components/ui/spinner'
 import { handleServerError } from '@/lib/handle-server-error'
 import { getServerErrorSources } from '@/lib/server-error-message'
 
@@ -175,7 +176,7 @@ export function TestPanel({
       {tools.isError && !catalogMode && (
         <ErrorState onRetry={() => void tools.refetch()} />
       )}
-      <Accordion multiple className='gap-3'>
+      <Accordion className='gap-3'>
         {tools.data
           ?.filter((tool) => !tool.removed && tool.pricing)
           .map((tool) => (
@@ -322,13 +323,16 @@ function ToolTest({
         )}
       </div>
       <Button
-        className='justify-self-start'
+        className='justify-self-start rounded-full'
+        size={busy ? 'icon' : 'default'}
+        aria-label={t('Execute')}
+        aria-busy={busy}
         type='submit'
         disabled={!ready || busy}
       >
-        {t('Run real test')}
+        {busy ? <Spinner aria-label={t('Running')} /> : t('Execute')}
       </Button>
-      {!run.isIdle && (
+      {!run.isIdle && !busy && (
         <details
           open={expanded}
           onToggle={(event) => setExpanded(event.currentTarget.open)}

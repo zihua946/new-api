@@ -19,9 +19,11 @@ type Installation = { id: string; authorized: boolean }
 export function InstallationConnection({
   item,
   installation,
+  compact = false,
 }: {
   item: Item
   installation: Installation
+  compact?: boolean
 }) {
   const { t } = useTranslation()
   const client = useQueryClient()
@@ -93,6 +95,19 @@ export function InstallationConnection({
   }
   return (
     <>
+      {!waiting &&
+        (compact || installation.authorized) &&
+        item.auth_mode !== 'none' && (
+          <Button
+            size='sm'
+            variant={compact ? 'secondary' : 'ghost'}
+            className={compact ? 'rounded-full px-4' : undefined}
+            disabled={change.isPending || !item.enabled}
+            onClick={() => act('reset')}
+          >
+            {compact ? t('Reset') : t('Reset authentication')}
+          </Button>
+        )}
       <Switch
         aria-label={item.name}
         checked={waiting || installation.authorized}
@@ -104,16 +119,6 @@ export function InstallationConnection({
       />
       {waiting && (
         <span role='status'>{t('Waiting for browser authorization')}</span>
-      )}
-      {!waiting && installation.authorized && item.auth_mode !== 'none' && (
-        <Button
-          size='sm'
-          variant='ghost'
-          disabled={change.isPending || !item.enabled}
-          onClick={() => act('reset')}
-        >
-          {t('Reset authentication')}
-        </Button>
       )}
     </>
   )

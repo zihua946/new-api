@@ -1,10 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
+import { Trash2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
-import { CopyButton } from '@/components/copy-button'
 import { EmptyState } from '@/components/empty-state'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
@@ -173,7 +173,7 @@ export function MCPMarketplace() {
                 </p>
               </CardContent>
             </a>
-            <CardFooter className='flex flex-wrap gap-2 border-t'>
+            <CardFooter className='flex min-h-16 flex-wrap justify-end gap-3 border-t'>
               {!item.enabled && (
                 <Badge variant='outline'>{t('Unavailable')}</Badge>
               )}
@@ -186,42 +186,38 @@ export function MCPMarketplace() {
                   {t('Install')}
                 </Button>
               )}
-              {item.installation && (
-                <InstallationConnection
-                  item={item}
-                  installation={item.installation}
-                />
-              )}
               {item.url && (
                 <a
-                  className={buttonVariants({ size: 'sm' })}
+                  className={buttonVariants({
+                    size: 'sm',
+                    variant: 'ghost',
+                    className:
+                      'pointer-events-none opacity-0 group-focus-within/card:pointer-events-auto group-focus-within/card:opacity-100 group-hover/card:pointer-events-auto group-hover/card:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100',
+                  })}
                   href={`/mcp/servers/${item.id}?tab=tools`}
                 >
                   {t('Test')}
                 </a>
               )}
-              {item.url && (
-                <CopyButton
-                  value={JSON.stringify(
-                    {
-                      url: item.url,
-                      transport: 'streamable_http',
-                      headers: { Authorization: 'Bearer <NEW_API_KEY>' },
-                    },
-                    null,
-                    2
-                  )}
-                  tooltip={t('Copy connection configuration')}
-                />
-              )}
               {item.installation && (
                 <Button
-                  size='sm'
+                  size='icon-sm'
                   variant='ghost'
+                  aria-label={t('Uninstall')}
+                  title={t('Uninstall')}
+                  className='text-destructive hover:bg-destructive/10 hover:text-destructive pointer-events-none opacity-0 group-focus-within/card:pointer-events-auto group-focus-within/card:opacity-100 group-hover/card:pointer-events-auto group-hover/card:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100'
+                  disabled={change.isPending}
                   onClick={() => setRemoving(item)}
                 >
-                  {t('Uninstall')}
+                  <Trash2 aria-hidden='true' />
                 </Button>
+              )}
+              {item.installation && (
+                <InstallationConnection
+                  item={item}
+                  installation={item.installation}
+                  compact
+                />
               )}
             </CardFooter>
           </Card>

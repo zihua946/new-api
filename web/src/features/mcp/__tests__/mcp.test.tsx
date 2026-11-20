@@ -23,7 +23,7 @@ import {
   createRouter,
   RouterProvider,
 } from "@tanstack/react-router";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -31,6 +31,7 @@ import { useAuthStore } from "@/stores/auth-store";
 
 import { MCPManagement } from "..";
 import { InvocationList } from "../invocations";
+import { InstallationConnection } from "../installation-connection";
 import { MCPMarketplace } from "../marketplace";
 import { ServerForm } from "../server-form";
 import { ServicePage } from "../service-page";
@@ -57,7 +58,7 @@ function renderMCPTest(authMode = "engine_api_key") {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   clients.push(client);
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <TestPanel
         server={
@@ -66,6 +67,7 @@ function renderMCPTest(authMode = "engine_api_key") {
       />
     </QueryClientProvider>,
   );
+  return { ...view, client };
 }
 
 describe("MCP management page", () => {
@@ -130,7 +132,7 @@ describe("MCP marketplace", () => {
     );
     expect(request.mock.calls.every((entry) => entry[1] !== "POST")).toBe(true);
   });
-  it("links an authorized installation to its tool form", async () => {
+  it("keeps marketplace authorization controls and reveals secondary actions on interaction", async () => {
     request.mockResolvedValue({
       items: [
         {
@@ -175,6 +177,10 @@ describe("MCP marketplace", () => {
     );
     expect(await screen.findByText("Connected")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Authorize" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Copy connection configuration" })).toBeNull();
+    const uninstall = screen.getAllByRole("button", { name: "Uninstall" })[1];
+    expect(uninstall).toHaveClass("text-destructive");
+    expect(uninstall).toHaveClass("pointer-events-none", "opacity-0", "group-hover/card:opacity-100", "group-focus-within/card:opacity-100", "[@media(hover:none)]:opacity-100");
     expect(screen.getByRole("link", { name: "Test" })).toHaveAttribute(
       "href",
       "/mcp/servers/remote-server?tab=tools",
@@ -198,7 +204,7 @@ describe("MCP marketplace", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     await user.click(screen.getByRole("switch", { name: "Search" }));
     expect(
-      screen.getByRole("button", { name: "Reset authentication" }),
+      screen.getByRole("button", { name: "Reset" }),
     ).toBeVisible();
     expect(screen.queryByRole("dialog")).toBeNull();
     await waitFor(() =>
@@ -207,10 +213,114 @@ describe("MCP marketplace", () => {
         "POST",
       ),
     );
+    uninstall.focus();
+    expect(uninstall).toHaveFocus();
+    await user.keyboard("{Enter}");
+    const confirmation = await screen.findByRole("alertdialog");
+    expect(request).not.toHaveBeenCalledWith("/self/installations/installation-1", "DELETE");
+    await user.click(within(confirmation).getByRole("button", { name: "Uninstall" }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith("/self/installations/installation-1", "DELETE"));
+  });
+  it.each([true, false])("resets a server with authorized=%s by revoking its grant before starting authorization", async (authorized) => {
+    const popup = {
+      closed: false,
+      opener: null,
+      sessionStorage: window.sessionStorage,
+      location: { replace: vi.fn() },
+      close: vi.fn(),
+    };
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    request.mockResolvedValue({ authorization_url: "https://provider.test/authorize" });
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    clients.push(client);
+    render(
+      <QueryClientProvider client={client}>
+        <InstallationConnection
+          compact
+          item={{ id: "server-1", name: "Search", description: "Search tools", auth_mode: "oauth2", enabled: true }}
+          installation={{ id: "installation-1", authorized }}
+        />
+      </QueryClientProvider>,
+    );
+    await userEvent.setup().click(screen.getByRole("button", { name: "Reset" }));
+    await waitFor(() => expect(popup.location.replace).toHaveBeenCalledWith("https://provider.test/authorize"));
+    expect(request.mock.calls.slice(0, 2)).toEqual([
+      ["/self/installations/installation-1/authorization", "DELETE"],
+      ["/self/installations/installation-1/authorization", "POST"],
+    ]);
+    expect(screen.getByRole("status")).toHaveTextContent("Waiting for browser authorization");
+    expect(screen.queryByRole("button", { name: "Reset" })).toBeNull();
+    window.sessionStorage.removeItem("mcp-return-installation");
   });
 });
 
 describe("MCP real test interaction", () => {
+  it("keeps only one tool open and preserves arguments across pointer and keyboard toggles", async () => {
+    request.mockResolvedValue([
+      { id: "fetch", name: "web_fetch", pricing: { charge_quota: 0 }, input_schema: { properties: { url: { type: "string" } }, required: ["url"] } },
+      { id: "search", name: "web_search", pricing: { charge_quota: 0 }, input_schema: { properties: { count: { type: "integer" }, query: { type: "string" }, language: { type: "string" }, category: { type: "string" } }, required: ["query", "category"] } },
+    ]);
+    const user = userEvent.setup();
+    renderMCPTest();
+    const fetch = await screen.findByRole("button", { name: "web_fetch" });
+    const search = screen.getByRole("button", { name: "web_search" });
+    await user.click(fetch);
+    await user.type(screen.getByRole("textbox", { name: "url" }), "https://example.test");
+    await user.click(search);
+    expect(fetch).toHaveAttribute("aria-expanded", "false");
+    expect(search).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByRole("textbox", { name: "url" })).toBeNull();
+    expect(screen.getAllByRole("textbox").map((field) => field.getAttribute("aria-label"))).toEqual(["query", "category", "language"]);
+    const form = screen.getByRole("region", { name: "web_search" });
+    expect(form).toHaveClass("transition-[height]", "h-(--accordion-panel-height)", "data-ending-style:h-0");
+    expect([...form.querySelectorAll("input")].map((field) => field.name)).toEqual(["arg:query", "arg:category", "arg:count", "arg:language"]);
+    expect(within(form).getByRole("button", { name: "Execute" })).toBeEnabled();
+    await user.click(search);
+    expect(search).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("textbox", { name: "query" })).toBeNull();
+    await user.keyboard("{Enter}");
+    expect(search).toHaveAttribute("aria-expanded", "true");
+    await user.click(fetch);
+    expect(screen.getByRole("textbox", { name: "url" })).toHaveValue("https://example.test");
+    expect(search).toHaveAttribute("aria-expanded", "false");
+    await user.keyboard(" ");
+    expect(fetch).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it.each([false, true])("shows only a spinner until polling finishes (failure=%s)", async (fails) => {
+    let resolveSubmission: ((value: { invocation_id: string }) => void) | undefined;
+    const submission = new Promise<{ invocation_id: string }>((resolve) => { resolveSubmission = resolve; });
+    let finished = false;
+    request.mockImplementation(async (path: string) => {
+      if (path.endsWith("/tools")) return [{ id: "tool-1", name: "web_search", revision: 1, input_schema: { properties: {}, additionalProperties: false }, pricing: { charge_quota: 0 } }];
+      if (path.endsWith("/test-invocations")) return submission;
+      if (!finished) return { invocation: { status: "running", billing_status: "reserved", funding_source: "intermediate-only" } };
+      if (fails) throw new Error("Result request failed");
+      return { invocation: { status: "succeeded", billing_status: "settled" }, result: { answer: "Final tool result" } };
+    });
+    const user = userEvent.setup();
+    const view = renderMCPTest();
+    await user.click(await screen.findByRole("button", { name: "web_search" }));
+    const execute = screen.getByRole("button", { name: "Execute" });
+    await user.click(execute);
+    expect(execute).toBeDisabled();
+    expect(execute).toHaveAttribute("aria-busy", "true");
+    expect(within(execute).getByRole("status", { name: "Running" })).toBeVisible();
+    expect(screen.queryByText("Result · JSON")).toBeNull();
+    await act(async () => resolveSubmission?.({ invocation_id: "pending-call" }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith("/test-invocations/pending-call"));
+    expect(screen.queryByText(/intermediate-only/)).toBeNull();
+    expect(screen.queryByText("Result · JSON")).toBeNull();
+    expect(execute).toBeDisabled();
+    finished = true;
+    await act(async () => view.client.refetchQueries({ queryKey: ["mcp", "test-result", "pending-call"] }));
+    expect(await screen.findByText(fails ? /Result request failed/ : /Final tool result/)).toBeVisible();
+    expect(execute).toBeEnabled();
+    expect(execute).toHaveAttribute("aria-busy", "false");
+    expect(within(execute).queryByRole("status")).toBeNull();
+    expect(screen.queryByText(/intermediate-only/)).toBeNull();
+  });
+
   it("starts collapsed and replaces the inline JSON on repeat execution", async () => {
     let calls = 0;
     request.mockImplementation(async (path: string) => {
@@ -224,7 +334,7 @@ describe("MCP real test interaction", () => {
     expect(toggle).toHaveAttribute("aria-expanded","false");
     await user.click(toggle);
     expect(screen.queryByText("Result · JSON")).toBeNull();
-    const execute = screen.getByRole("button",{name:"Run real test"});
+    const execute = screen.getByRole("button",{name:"Execute"});
     await user.click(execute);
     expect(await screen.findByText(/call-1/)).toBeVisible();
     await user.click(screen.getByText("Result · JSON"));
@@ -362,10 +472,10 @@ describe("MCP real test interaction", () => {
     expect(screen.getByLabelText("offset")).not.toBeRequired();
     await user.type(screen.getByLabelText("query"), "DeepSeek API docs");
     await user.selectOptions(screen.getByLabelText("need_content"), "false");
-    await user.click(screen.getByRole("button", { name: "Run real test" }));
+    await user.click(screen.getByRole("button", { name: "Execute" }));
     expect(await screen.findByText(/Network unavailable/)).toBeVisible();
     expect(screen.getByText(/0.001 Credits/)).toBeInTheDocument();
-    await user.click(screen.getByRole("button",{name:"Run real test"}));
+    await user.click(screen.getByRole("button",{name:"Execute"}));
     await waitFor(() => expect(submitted).toBe(2));
     const calls = request.mock.calls.filter((call) =>
       call[0].endsWith("/test-invocations"),
@@ -378,8 +488,9 @@ describe("MCP real test interaction", () => {
     });
     expect(calls[0][3]).toBeTruthy();
     expect(calls[1][3]).toBe(calls[0][3]);
-    expect(await screen.findByText(/Refund pending/)).toBeInTheDocument();
-    expect(screen.getByRole("button",{name:"Run real test"})).toBeDisabled();
+    expect(screen.queryByText("Result · JSON")).toBeNull();
+    expect(screen.getByRole("status", { name: "Running" })).toBeVisible();
+    expect(screen.getByRole("button",{name:"Execute"})).toBeDisabled();
   });
 });
 
