@@ -19,7 +19,6 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/setting"
-	"github.com/google/uuid"
 
 	"github.com/gin-gonic/gin"
 )
@@ -103,8 +102,7 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 		return true
 	}
 
-	operationID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("midjourney:%d:wallet-refund", task.Id))).String()
-	if err := model.AdjustQuotaWithID(operationID, task.BillingPayerID(), 0, quota); err != nil {
+	if err := model.IncreaseUserQuota(task.BillingPayerID(), quota, false); err != nil {
 		logger.LogWarn(ctx, fmt.Sprintf("退还 Midjourney 用户额度失败 task %s: %s", task.MjId, err.Error()))
 		return false
 	}
@@ -112,8 +110,7 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 	if task.TokenId > 0 {
 		tokenKey := resolveTokenKey(ctx, task.TokenId, task.MjId)
 		if tokenKey != "" {
-			tokenOperationID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("midjourney:%d:token-refund", task.Id))).String()
-			if err := model.AdjustQuotaWithID(tokenOperationID, 0, task.TokenId, quota); err != nil {
+			if err := model.IncreaseTokenQuota(task.TokenId, tokenKey, quota); err != nil {
 				logger.LogWarn(ctx, fmt.Sprintf("退还 Midjourney 令牌额度失败 task %s: %s", task.MjId, err.Error()))
 			}
 		}

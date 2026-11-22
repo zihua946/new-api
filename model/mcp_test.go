@@ -2,7 +2,6 @@ package model
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -17,7 +16,6 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -48,7 +46,7 @@ func setupMCPDatabase(t *testing.T) {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(8)
 	if databaseType != common.DatabaseTypeSQLite {
-		require.NoError(t, db.Migrator().DropTable(&MCPServer{}, &MCPTool{}, &MCPDiscovery{}, &MCPInvocation{}, &MCPBillingOperation{}, &MCPTaskBinding{}, &MCPTestAuthorization{}, &QuotaOperation{}, &Token{}, &User{}))
+		require.NoError(t, db.Migrator().DropTable(&SubscriptionPreConsumeRecord{}, &UserSubscription{}, &SubscriptionPlan{}, &MCPServer{}, &MCPTool{}, &MCPDiscovery{}, &MCPInvocation{}, &MCPBillingOperation{}, &MCPTaskBinding{}, &MCPTestAuthorization{}, &Token{}, &User{}))
 		var version string
 		require.NoError(t, db.Raw("SELECT version()").Scan(&version).Error)
 		t.Logf("database: %s", version)
@@ -82,7 +80,7 @@ func setupMCPFunds(t *testing.T, useRedis bool) (User, Token) {
 		require.NoError(t, client.FlushDB(context.Background()).Err())
 		t.Cleanup(func() { _ = client.Close() })
 	}
-	require.NoError(t, DB.AutoMigrate(&User{}, &Token{}, &QuotaOperation{}, &UserSubscription{}, &SubscriptionPreConsumeRecord{}, &SubscriptionPlan{}))
+	require.NoError(t, DB.AutoMigrate(&User{}, &Token{}, &UserSubscription{}, &SubscriptionPreConsumeRecord{}, &SubscriptionPlan{}))
 	user := User{Id: 51, Username: "mcp-funds", Quota: 1000, Status: common.UserStatusEnabled, AuthVersion: 1}
 	token := Token{Id: 61, UserId: user.Id, Key: "mcp-funds-token", RemainQuota: 1000, Status: common.TokenStatusEnabled, ExpiredTime: -1}
 	require.NoError(t, DB.Create(&user).Error)
@@ -90,55 +88,73 @@ func setupMCPFunds(t *testing.T, useRedis bool) (User, Token) {
 	return user, token
 }
 
-func TestMCPFundingCrashRecovery(t *testing.T) {
-	for _, stage := range []string{"reserve", "reserve_evicted_user", "refund"} {
-		t.Run(stage, func(t *testing.T) {
-			user, token := setupMCPFunds(t, true)
+func TestMCPInterruptedFundingIsNotReplayed(t *testing.T) {
+	for _, kind := range []string{"reserve", "refund"} {
+		t.Run(kind, func(t *testing.T) {
+			user, token := setupMCPFunds(t, false)
 			deadline := time.Now().UTC().Add(-time.Minute)
-			call := MCPInvocation{ID: "crash-call", IdempotencyHash: "crash-key", UserID: user.Id, PayerUserID: user.Id, TokenID: token.Id, ChargeQuota: 300, Status: "unknown", BillingStatus: "reserving", ReconcileAt: &deadline}
+			call := MCPInvocation{ID: "interrupted-call", IdempotencyHash: "interrupted-key", UserID: user.Id, PayerUserID: user.Id, TokenID: token.Id, ChargeQuota: 300, Status: "unknown", BillingStatus: "reserving", ReconcileAt: &deadline}
 			require.NoError(t, DB.Create(&call).Error)
-			if stage == "refund" {
+			if kind == "refund" {
 				require.NoError(t, ReserveMCPCharge(call.ID))
 			}
-			injected := false
-			require.NoError(t, DB.Callback().Update().Before("gorm:update").Register("mcp_test_crash", func(tx *gorm.DB) {
-				if !injected && tx.Statement.Table == "mcp_billing_operations" {
-					injected = true
-					tx.AddError(errors.New("simulated SQL failure before operation commit"))
+			require.NoError(t, DB.Callback().Update().Before("gorm:update").Register("mcp_test_outcome", func(tx *gorm.DB) {
+				updates, _ := tx.Statement.Dest.(map[string]any)
+				if tx.Statement.Table == "mcp_billing_operations" && updates["state"] == "applied" {
+					tx.AddError(errors.New("interrupted after balance mutation"))
 				}
 			}))
-			if stage == "refund" {
-				require.Error(t, RefundMCPCharge(call.ID))
-			} else {
-				require.Error(t, ReserveMCPCharge(call.ID))
-			}
-			require.True(t, injected)
-			require.NoError(t, DB.Callback().Update().Remove("mcp_test_crash"))
-			if stage == "reserve_evicted_user" {
-				require.NoError(t, common.RDB.Del(context.Background(), getUserCacheKey(user.Id)).Err())
-			}
+			err := applyMCPCharge(call.ID, kind)
+			require.ErrorIs(t, err, ErrMCPBillingPending)
+			require.NoError(t, DB.Callback().Update().Remove("mcp_test_outcome"))
 			for range 2 {
-				require.NoError(t, ReconcileMCPCharge(call.ID, time.Now().UTC()))
+				require.ErrorIs(t, applyMCPCharge(call.ID, kind), ErrMCPBillingPending)
+				require.ErrorIs(t, ReconcileMCPCharge(call.ID, time.Now().UTC()), ErrMCPBillingPending)
+			}
+			want := 700
+			if kind == "refund" {
+				want = 1000
 			}
 			require.NoError(t, DB.First(&user, user.Id).Error)
 			require.NoError(t, DB.First(&token, token.Id).Error)
-			assert.Equal(t, 1000, user.Quota)
-			assert.Equal(t, 1000, token.RemainQuota)
-			assert.Zero(t, token.UsedQuota)
-			cached, err := GetUserCache(user.Id)
-			require.NoError(t, err)
-			assert.Equal(t, 1000, cached.Quota)
-			cachedToken, err := GetTokenByKey(token.Key, true)
-			require.NoError(t, err)
-			assert.Equal(t, 1000, cachedToken.RemainQuota)
-			// A late success never recharges an invocation released at its deadline.
-			require.NoError(t, DB.Model(&call).Updates(map[string]any{"status": "succeeded", "billable": true}).Error)
-			require.NoError(t, ReconcileMCPCharge(call.ID, time.Now().UTC()))
-			require.NoError(t, DB.First(&call, "id = ?", call.ID).Error)
-			assert.Equal(t, "refunded", call.BillingStatus)
-			assert.Zero(t, call.ChargedQuota)
+			assert.Equal(t, want, user.Quota)
+			assert.Equal(t, want, token.RemainQuota)
+			var op MCPBillingOperation
+			require.NoError(t, DB.First(&op, "id = ?", call.ID+":"+kind).Error)
+			assert.Equal(t, "executing", op.State, "uncertain legacy writes require manual reconciliation")
 		})
 	}
+}
+
+func TestMCPConcurrentDuplicateDoesNotRepeatBalanceMutation(t *testing.T) {
+	user, token := setupMCPFunds(t, false)
+	call := MCPInvocation{ID: "duplicate-call", IdempotencyHash: "duplicate-key", UserID: user.Id, PayerUserID: user.Id, TokenID: token.Id, ChargeQuota: 300, BillingStatus: "reserving"}
+	require.NoError(t, DB.Create(&call).Error)
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	require.NoError(t, DB.Callback().Update().Before("gorm:update").Register("mcp_duplicate_balance", func(tx *gorm.DB) {
+		if tx.Statement.Table == "users" {
+			close(started)
+			<-release
+		}
+	}))
+	t.Cleanup(func() { _ = DB.Callback().Update().Remove("mcp_duplicate_balance") })
+	result := make(chan error, 1)
+	go func() { result <- ReserveMCPCharge(call.ID) }()
+	select {
+	case <-started:
+	case err := <-result:
+		require.FailNow(t, "reservation ended before reaching the balance API", "%v", err)
+	}
+	err := ReserveMCPCharge(call.ID)
+	unblock()
+	require.ErrorIs(t, err, ErrMCPBillingPending)
+	require.NoError(t, <-result)
+	require.NoError(t, ReserveMCPCharge(call.ID))
+	assert.Equal(t, 700, getUserQuotaFromDB(t, user.Id))
+	assert.Equal(t, 700, getTokenFromDB(t, token.Id).RemainQuota)
 }
 
 func TestMCPAndModelConcurrentReservation(t *testing.T) {
@@ -203,7 +219,7 @@ func TestMCPBillingReserveSettleAndRefund(t *testing.T) {
 				common.RDB = redis.NewClient(&redis.Options{Addr: server.Addr()})
 				t.Cleanup(func() { _ = common.RDB.Close() })
 			}
-			require.NoError(t, DB.AutoMigrate(&User{}, &Token{}, &QuotaOperation{}, &UserSubscription{}, &SubscriptionPreConsumeRecord{}, &SubscriptionPlan{}))
+			require.NoError(t, DB.AutoMigrate(&User{}, &Token{}, &UserSubscription{}, &SubscriptionPreConsumeRecord{}, &SubscriptionPlan{}))
 			user := User{Id: 31, Username: "mcp-user", Quota: 1000, Status: common.UserStatusEnabled, AuthVersion: 1}
 			token := Token{Id: 41, UserId: user.Id, Key: "mcp-test-token", RemainQuota: 700, Status: common.TokenStatusEnabled, ExpiredTime: -1}
 			require.NoError(t, DB.Create(&user).Error)
@@ -299,19 +315,12 @@ func TestMCPInvocationIdempotency(t *testing.T) {
 }
 
 func TestMCPFundingRejectsInvalidAccumulation(t *testing.T) {
-	for _, field := range []string{"sql_token", "redis_token", "settlement", "operation_owner"} {
+	for _, field := range []string{"settlement", "operation_owner"} {
 		t.Run(field, func(t *testing.T) {
 			user, token := setupMCPFunds(t, true)
 			call := MCPInvocation{ID: "bounded-call", IdempotencyHash: "bounded-key", UserID: user.Id, PayerUserID: user.Id, TokenID: token.Id, ChargeQuota: 300, Status: "running", BillingStatus: "reserving"}
 			require.NoError(t, DB.Create(&call).Error)
 			switch field {
-			case "sql_token":
-				require.NoError(t, DB.Model(&token).Update("used_quota", common.MaxWalletQuota).Error)
-			case "redis_token":
-				require.NoError(t, populateUserCache(user))
-				_, err := cacheInitToken(token)
-				require.NoError(t, err)
-				require.NoError(t, common.RDB.HSet(context.Background(), getTokenCacheKey(token.Key), "UsedQuota", common.MaxWalletQuota).Err())
 			case "operation_owner":
 				require.NoError(t, DB.Create(&MCPBillingOperation{ID: call.ID + ":reserve", InvocationID: call.ID, Kind: "reserve", Amount: 300, PayerUserID: user.Id + 1, TokenID: token.Id, State: "pending"}).Error)
 			case "settlement":
@@ -383,187 +392,59 @@ func TestMCPBillingWithModelBatchAndPersonalFallback(t *testing.T) {
 	}
 }
 
-func TestMCPDoesNotSpendModelBatchDeductionsAfterCacheEviction(t *testing.T) {
+// MCP must preserve the legacy Redis-first, batch-later behavior rather than
+// changing shared balances to synchronous SQL or flushing unrelated model calls.
+func TestMCPReservationUsesLegacyBatchQueue(t *testing.T) {
 	user, token := setupMCPFunds(t, true)
 	resetBatchUpdateTestState(t)
 	common.BatchUpdateEnabled = true
-	reserved, err := TryReserveUserQuota(user.Id, 700)
-	require.NoError(t, err)
-	require.True(t, reserved)
-	require.NoError(t, common.RDB.Del(context.Background(), getUserCacheKey(user.Id)).Err())
-	call := MCPInvocation{ID: "eviction-call", IdempotencyHash: "eviction-key", UserID: user.Id, PayerUserID: user.Id, TokenID: token.Id, ChargeQuota: 700, Status: "running", BillingStatus: "reserving"}
+	call := MCPInvocation{ID: "batch-reservation", IdempotencyHash: "batch-reservation", UserID: user.Id, PayerUserID: user.Id, TokenID: token.Id, ChargeQuota: 300, BillingStatus: "reserving"}
 	require.NoError(t, DB.Create(&call).Error)
-	require.ErrorIs(t, ReserveMCPCharge(call.ID), ErrMCPInsufficientQuota)
-	batchUpdate()
-	require.NoError(t, DB.First(&user, user.Id).Error)
-	assert.Equal(t, 300, user.Quota)
-}
-
-// The same contracts run on the isolated SQLite/MySQL/PostgreSQL fixtures.
-func TestSharedQuotaDurableRecovery(t *testing.T) {
-	for _, useRedis := range []bool{false, true} {
-		t.Run(map[bool]string{false: "sql", true: "redis"}[useRedis], func(t *testing.T) {
-			user, token := setupMCPFunds(t, useRedis)
-			common.BatchUpdateEnabled = true
-			ok, err := TryReserveUserQuota(user.Id, 700)
-			require.NoError(t, err)
-			require.True(t, ok)
-			ok, err = TryReserveTokenQuota(token.Id, token.Key, 700, false)
-			require.NoError(t, err)
-			require.True(t, ok)
-			assert.Equal(t, 300, getUserQuotaFromDB(t, user.Id))
-			assert.Equal(t, 300, getTokenFromDB(t, token.Id).RemainQuota)
-
-			operationID := uuid.NewString()
-			require.NoError(t, DB.Callback().Update().Before("gorm:update").Register("quota_completion_failure", func(tx *gorm.DB) {
-				updates, _ := tx.Statement.Dest.(map[string]any)
-				if tx.Statement.Table == "quota_operations" && updates["state"] == "applied" {
-					tx.AddError(errors.New("connection interrupted before commit"))
-				}
-			}))
-			err = AdjustQuotaWithID(operationID, user.Id, token.Id, 300)
-			var pending *QuotaOperationPending
-			require.ErrorAs(t, err, &pending)
-			assert.Equal(t, operationID, pending.ID)
-			require.NoError(t, DB.Callback().Update().Remove("quota_completion_failure"))
-			assert.Equal(t, 300, getUserQuotaFromDB(t, user.Id), "rolled back wallet and token together")
-			assert.Equal(t, 300, getTokenFromDB(t, token.Id).RemainQuota)
-			if useRedis {
-				require.NoError(t, common.RDB.Del(context.Background(), getUserCacheKey(user.Id), getTokenCacheKey(token.Key)).Err())
-			}
-			// Recovery needs only persisted state, not an in-memory billing session.
-			for range 2 {
-				_, err = RecoverQuotaOperations(context.Background(), time.Now().UTC())
-				require.NoError(t, err)
-			}
-			require.NoError(t, AdjustQuotaWithID(operationID, user.Id, token.Id, 300))
-			require.ErrorIs(t, AdjustQuotaWithID(operationID, user.Id, token.Id, 301), ErrQuotaOperationConflict)
-			assert.Equal(t, 600, getUserQuotaFromDB(t, user.Id))
-			assert.Equal(t, 600, getTokenFromDB(t, token.Id).RemainQuota)
-			assert.Equal(t, 400, getTokenFromDB(t, token.Id).UsedQuota)
-			batchUpdate()
-			assert.Equal(t, 600, getUserQuotaFromDB(t, user.Id), "statistics flush cannot apply the charge twice")
-
-			// A reservation interrupted before its transaction must never become
-			// a new debit after the caller has already rejected the request.
-			orphan := QuotaOperation{ID: uuid.NewString(), UserID: user.Id, Delta: -500, Kind: "reserve", State: "pending", CreatedAt: time.Now().UTC().Add(-11 * time.Minute)}
-			require.NoError(t, DB.Create(&orphan).Error)
-			_, err = RecoverQuotaOperations(context.Background(), time.Now().UTC())
-			require.NoError(t, err)
-			require.NoError(t, DB.First(&orphan, "id = ?", orphan.ID).Error)
-			assert.Equal(t, "cancelled", orphan.State)
-			assert.Equal(t, 600, getUserQuotaFromDB(t, user.Id))
-		})
-	}
-}
-
-type lostQuotaCacheReply struct{ lost bool }
-
-func (h *lostQuotaCacheReply) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
-	return ctx, nil
-}
-func (h *lostQuotaCacheReply) AfterProcess(ctx context.Context, cmd redis.Cmder) error {
-	args := cmd.Args()
-	if !h.lost && len(args) > 1 && args[0] == "eval" && args[1] == invalidateQuotaBalancesScript {
-		h.lost = true
-		return errors.New("lost Redis reply after successful invalidation")
-	}
-	return nil
-}
-func (h *lostQuotaCacheReply) BeforeProcessPipeline(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
-	return ctx, nil
-}
-func (h *lostQuotaCacheReply) AfterProcessPipeline(ctx context.Context, cmds []redis.Cmder) error {
-	return nil
-}
-
-func TestSharedQuotaLostCacheReplyAndStaleHydration(t *testing.T) {
-	user, token := setupMCPFunds(t, true)
-	hook := &lostQuotaCacheReply{}
-	common.RDB.AddHook(hook)
-	ok, err := TryReserveUserQuota(user.Id, 700)
-	require.ErrorIs(t, err, ErrQuotaCacheUnavailable)
-	require.True(t, hook.lost)
-	assert.False(t, ok)
+	require.NoError(t, ReserveMCPCharge(call.ID))
+	require.NoError(t, ReserveMCPCharge(call.ID))
 	assert.Equal(t, 1000, getUserQuotaFromDB(t, user.Id))
+	assert.Equal(t, 1000, getTokenFromDB(t, token.Id).RemainQuota)
 	cached, err := GetUserCache(user.Id)
 	require.NoError(t, err)
-	assert.Equal(t, 1000, cached.Quota)
-
-	ok, err = TryReserveUserQuota(user.Id, 700)
+	assert.Equal(t, 700, cached.Quota)
+	cachedToken, err := cacheGetTokenByKey(token.Key)
 	require.NoError(t, err)
-	require.True(t, ok)
-	ok, err = TryReserveTokenQuota(token.Id, token.Key, 700, false)
-	require.NoError(t, err)
-	require.True(t, ok)
-	// Explicitly publish the pre-charge snapshots after the commit. Hydration
-	// must re-read SQL, including when the old cache has been evicted.
-	require.NoError(t, populateUserCache(user))
-	_, err = cacheInitToken(token)
-	require.NoError(t, err)
-	cached, err = GetUserCache(user.Id)
-	require.NoError(t, err)
-	assert.Equal(t, 300, cached.Quota)
-	cachedToken, err := GetTokenByKey(token.Key, true)
-	require.NoError(t, err)
-	assert.Equal(t, 300, cachedToken.RemainQuota)
-	// A late post-commit credit notification must not add a credit twice.
-	require.NoError(t, DB.Model(&user).Update("quota", gorm.Expr("quota + ?", 100)).Error)
-	require.NoError(t, invalidateUserCache(user.Id))
-	_, err = GetUserCache(user.Id)
-	require.NoError(t, err)
-	syncCreditUserQuotaCache(user.Id, 100, "test credit")
-	cached, err = GetUserCache(user.Id)
-	require.NoError(t, err)
-	assert.Equal(t, 400, cached.Quota)
+	assert.Equal(t, 700, cachedToken.RemainQuota)
+	batchUpdate()
+	assert.Equal(t, 700, getUserQuotaFromDB(t, user.Id))
+	assert.Equal(t, 700, getTokenFromDB(t, token.Id).RemainQuota)
 }
 
-// Delegate to the real database, then lose only the acknowledgement. This is
-// different from a rollback: retrying a plain decrement would double charge.
-type lostQuotaCommitPool struct {
-	*sql.DB
-	commits int
-	lost    bool
-}
-type lostQuotaCommitTx struct {
-	*sql.Tx
-	pool *lostQuotaCommitPool
+func TestMCPAbandonedBatchCannotCreateRefundCredit(t *testing.T) {
+	user, token := setupMCPFunds(t, true)
+	resetBatchUpdateTestState(t)
+	common.BatchUpdateEnabled = true
+	deadline := time.Now().UTC().Add(-time.Minute)
+	call := MCPInvocation{ID: "abandoned-batch", IdempotencyHash: "abandoned-batch", UserID: user.Id, PayerUserID: user.Id, TokenID: token.Id, ChargeQuota: 300, BillingStatus: "reserving", Status: "unknown", ReconcileAt: &deadline}
+	require.NoError(t, DB.Create(&call).Error)
+	require.NoError(t, ReserveMCPCharge(call.ID))
+	// Simulate owner-process loss, including its unflushed legacy batch.
+	require.NoError(t, DB.Model(&MCPBillingOperation{}).Where("id = ?", mcpFundingOperationID(&call, "reserve")).Update("state", "batch:previous-process").Error)
+	resetBatchUpdateTestState(t)
+	for range 2 {
+		require.ErrorIs(t, ReconcileMCPCharge(call.ID, time.Now().UTC()), ErrMCPBillingPending)
+		require.ErrorIs(t, RefundMCPCharge(call.ID), ErrMCPBillingPending)
+	}
+	assert.Equal(t, 1000, getUserQuotaFromDB(t, user.Id), "never credit a reservation that may not have reached SQL")
+	assert.Equal(t, 1000, getTokenFromDB(t, token.Id).RemainQuota)
 }
 
-func (p *lostQuotaCommitPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
-	tx, err := p.DB.BeginTx(ctx, opts)
-	if err != nil {
-		return nil, err
+func TestMCPTokenRejectionRefundsFundingOnce(t *testing.T) {
+	user, token := setupMCPFunds(t, false)
+	require.NoError(t, DB.Model(&token).Update("remain_quota", 100).Error)
+	call := MCPInvocation{ID: "token-rejection", IdempotencyHash: "token-rejection", UserID: user.Id, PayerUserID: user.Id, TokenID: token.Id, ChargeQuota: 300, BillingStatus: "reserving"}
+	require.NoError(t, DB.Create(&call).Error)
+	require.ErrorIs(t, ReserveMCPCharge(call.ID), ErrMCPTokenQuota)
+	for range 2 {
+		require.NoError(t, ReconcileMCPCharge(call.ID, time.Now().UTC()))
 	}
-	return &lostQuotaCommitTx{Tx: tx, pool: p}, nil
-}
-func (tx *lostQuotaCommitTx) Commit() error {
-	if err := tx.Tx.Commit(); err != nil {
-		return err
-	}
-	tx.pool.commits++
-	if tx.pool.commits == 2 {
-		tx.pool.lost = true
-		return errors.New("lost acknowledgement of committed quota transaction")
-	}
-	return nil
-}
-func TestSharedQuotaLostSQLCommitAcknowledgement(t *testing.T) {
-	user, _ := setupMCPFunds(t, true)
-	sqlDB, err := DB.DB()
-	require.NoError(t, err)
-	pool := &lostQuotaCommitPool{DB: sqlDB}
-	previousPool, previousStatementPool := DB.ConnPool, DB.Statement.ConnPool
-	DB.ConnPool, DB.Statement.ConnPool = pool, pool
-	t.Cleanup(func() { DB.ConnPool, DB.Statement.ConnPool = previousPool, previousStatementPool })
-	ok, err := TryReserveUserQuota(user.Id, 700)
-	require.True(t, pool.lost, "test must lose the quota commit acknowledgement, not the intent insert")
-	require.NoError(t, err, "the committed operation resolves the uncertain result")
-	require.True(t, ok)
-	assert.Equal(t, 300, getUserQuotaFromDB(t, user.Id))
-	_, err = RecoverQuotaOperations(context.Background(), time.Now().UTC().Add(11*time.Minute))
-	require.NoError(t, err)
-	assert.Equal(t, 300, getUserQuotaFromDB(t, user.Id))
+	assert.Equal(t, 1000, getUserQuotaFromDB(t, user.Id))
+	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
 }
 
 func TestMCPSubscriptionFundingMatchesPreference(t *testing.T) {

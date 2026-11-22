@@ -66,13 +66,7 @@ func CreateServer(input ServerInput) (*model.MCPServer, error) {
 		input.Kind = "remote_mcp"
 		if kind := LocalProvider(input.Connection.URL); kind != "" {
 			input.Slug, input.Kind = "provider-"+kind, kind
-			if input.Connection.ClientID == "" && input.ClientSecret == "" {
-				input.AuthMode = "oauth2"
-				input.Connection.ClientID = os.Getenv("MCP_OAUTH_CLIENT_ID")
-				if input.Connection.ClientID == "" {
-					return nil, Failure(503, "MCP_NOT_CONFIGURED", "Configure the MCP OAuth client ID before creating the local provider")
-				}
-			}
+
 		}
 	}
 	if !slugPattern.MatchString(input.Slug) {
@@ -230,16 +224,16 @@ func NormalizeServer(server *model.MCPServer) error {
 		if server.AuthMode == "" {
 			server.AuthMode = "none"
 		}
-		if server.AuthMode == "none" && server.Kind == "remote_mcp" {
-			server.Connection = model.MCPConnection{URL: server.Connection.URL, Transport: server.Connection.Transport}
-			return nil
-		}
-		if server.AuthMode != "oauth2" || strings.TrimSpace(server.Connection.ClientID) == "" || len(server.Connection.ClientID) > 256 || len(server.Connection.Scopes) > 2048 {
-			return Failure(422, "INVALID_OAUTH_CONFIG", "OAuth2 requires a registered client ID")
+		if len(server.Connection.Scopes) > 2048 {
+			return Failure(422, "INVALID_OAUTH_CONFIG", "OAuth scopes are too long")
 		}
 		scopes := strings.Join(strings.Fields(server.Connection.Scopes), " ")
-		if server.Kind != "remote_mcp" && scopes == "" {
-			scopes = "mcp:tools:read mcp:tools:call"
+		if server.AuthMode == "none" && server.Kind == "remote_mcp" {
+			server.Connection = model.MCPConnection{URL: server.Connection.URL, Transport: server.Connection.Transport, Scopes: scopes}
+			return nil
+		}
+		if server.AuthMode != "oauth2" || server.Kind != "deepseek" && strings.TrimSpace(server.Connection.ClientID) == "" || len(server.Connection.ClientID) > 256 {
+			return Failure(422, "INVALID_OAUTH_CONFIG", "OAuth2 requires a registered client ID")
 		}
 		server.Connection = model.MCPConnection{URL: server.Connection.URL, Transport: server.Connection.Transport, ClientID: strings.TrimSpace(server.Connection.ClientID), Scopes: scopes}
 		return nil

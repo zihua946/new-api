@@ -45,11 +45,21 @@ import {
   SelectContent,
   SelectItem,
 } from '@/components/ui/select'
-import { formatQuotaWithCurrency, getCurrencyDisplay } from '@/lib/currency'
+import { getCurrencyDisplay } from '@/lib/currency'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { mcpRequest } from './api'
-import type { MCPDiscovery, MCPServer, MCPTool } from './types'
+import type { MCPDiscovery, MCPPrice, MCPServer, MCPTool } from './types'
+
+function formatToolPrice(price: MCPPrice): string {
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: price.currency || 'USD',
+    currencyDisplay: 'narrowSymbol',
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 12,
+  }).format(Number(price.unit_price ?? price.unit_price_usd))
+}
 
 export function ToolPanel({
   server,
@@ -63,6 +73,7 @@ export function ToolPanel({
   write: boolean
 }) {
   const { t } = useTranslation()
+  const canEditPrice = write || sensitive
   const client = useQueryClient()
   const [editing, setEditing] = useState<MCPTool | null>(null)
   const [enabling, setEnabling] = useState<MCPTool | null>(null)
@@ -163,6 +174,11 @@ export function ToolPanel({
           {t('Discover tools')}
         </Button>
       )}
+      {!canEditPrice && (
+        <p className='text-muted-foreground text-sm'>
+          {t('Price editing requires MCP service editing permission.')}
+        </p>
+      )}
       <StaticDataTable
         data={tools.data ?? []}
         getRowKey={(tool) => tool.id}
@@ -191,15 +207,9 @@ export function ToolPanel({
             header: t('Price'),
             cell: (tool) => {
               if (tool.pricing) {
-                return (
-                  <span>
-                    {formatQuotaWithCurrency(tool.pricing.charge_quota)} ·{' '}
-                    {tool.pricing.effective_credits} Credits ·{' '}
-                    {tool.pricing.charge_quota} quota
-                  </span>
-                )
+                return formatToolPrice(tool.pricing)
               }
-              return sensitive ? (
+              return canEditPrice ? (
                 <Button variant='link' onClick={() => setEditing(tool)}>
                   {t('Not configured')}
                 </Button>
@@ -211,16 +221,26 @@ export function ToolPanel({
           {
             id: 'actions',
             header: t('Actions'),
-            cell: (tool) =>
-              operate && (
+            cell: (tool) => (
+              <div className='flex flex-wrap gap-2'>
                 <Button
                   variant='outline'
-                  disabled={tool.removed || toggle.isPending}
-                  onClick={() => setEnabling(tool)}
+                  disabled={!canEditPrice || tool.removed}
+                  onClick={() => setEditing(tool)}
                 >
-                  {tool.enabled ? t('Disable') : t('Enable')}
+                  {t('Edit price')}
                 </Button>
-              ),
+                {operate && (
+                  <Button
+                    variant='outline'
+                    disabled={tool.removed || toggle.isPending}
+                    onClick={() => setEnabling(tool)}
+                  >
+                    {tool.enabled ? t('Disable') : t('Enable')}
+                  </Button>
+                )}
+              </div>
+            ),
           },
         ]}
       />
@@ -229,7 +249,7 @@ export function ToolPanel({
           key={`${editing.id}:${editing.revision}`}
           tool={editing}
           server={server}
-          sensitive={sensitive}
+          canEditPrice={canEditPrice}
           write={write}
           onClose={() => setEditing(null)}
         />
@@ -348,13 +368,13 @@ const toolSchema = z.object({
 function ToolForm({
   tool,
   server,
-  sensitive,
+  canEditPrice,
   write,
   onClose,
 }: {
   tool: MCPTool
   server: MCPServer
-  sensitive: boolean
+  canEditPrice: boolean
   write: boolean
   onClose: () => void
 }) {
@@ -363,7 +383,7 @@ function ToolForm({
   const config = getCurrencyDisplay().config
   const preferred = ['CNY', 'USD'].includes(config.quotaDisplayType)
     ? config.quotaDisplayType
-    : (tool.pricing?.currency ?? '')
+    : tool.pricing?.currency || 'USD'
   let displayedPrice = tool.pricing?.unit_price_usd ?? '0'
   if (tool.pricing && preferred === tool.pricing.currency) {
     displayedPrice = tool.pricing.unit_price ?? tool.pricing.unit_price_usd
@@ -398,9 +418,9 @@ function ToolForm({
         setRevision(expectedRevision)
       }
       if (
-        sensitive &&
+        canEditPrice &&
         (!tool.pricing ||
-          form.formState.dirtyFields.price ||
+          values.price !== displayedPrice ||
           currency !== preferred)
       ) {
         await mcpRequest(
@@ -428,11 +448,11 @@ function ToolForm({
       }}
       title={tool.name}
       footer={
-        (sensitive || write) && (
+        (canEditPrice || write) && (
           <Button
             form='mcp-tool-form'
             type='submit'
-            disabled={save.isPending || (sensitive && !currency)}
+            disabled={save.isPending || (canEditPrice && !currency)}
           >
             {t('Save')}
           </Button>
@@ -447,7 +467,7 @@ function ToolForm({
         >
           <Select
             value={currency}
-            disabled={!sensitive}
+            disabled={!canEditPrice}
             onValueChange={(v) => setCurrency(v ?? '')}
           >
             <SelectTrigger aria-label={t('Currency')}>
@@ -471,7 +491,7 @@ function ToolForm({
                   currency === 'CNY'
                     ? `${t('Price')} (CNY)`
                     : t('USD per successful call (0 is free)'),
-                disabled: !sensitive,
+                disabled: !canEditPrice,
               },
             ] as const
           ).map((item) => (
@@ -493,9 +513,7 @@ function ToolForm({
             />
           ))}
           <p className='text-muted-foreground text-sm'>
-            {tool.pricing
-              ? `${tool.pricing.effective_credits} Credits · ${tool.pricing.charge_quota} quota · ${tool.pricing.quota_per_unit} quota/USD`
-              : t('Not configured')}
+            {tool.pricing ? formatToolPrice(tool.pricing) : t('Not configured')}
           </p>
           <pre className='max-h-96 overflow-auto text-xs break-all whitespace-pre-wrap'>
             {JSON.stringify(

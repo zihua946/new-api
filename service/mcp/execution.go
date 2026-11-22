@@ -145,6 +145,9 @@ func PrepareCall(serverID, toolName string, actor *Actor, arguments map[string]a
 	if (options.Test || options.ConfirmPrice) && (options.MaxChargeQuota == nil || *options.MaxChargeQuota < quote.ChargeQuota) {
 		return nil, Failure(409, "PRICE_CONFIRMATION_REQUIRED", "Confirm the current maximum charge before testing")
 	}
+	if actor.Delegation != nil && quote.ChargeQuota > actor.Delegation.MaxChargeQuota {
+		return nil, Failure(403, "DELEGATION_BUDGET_EXCEEDED", "Tool price exceeds the application's per-call budget")
+	}
 	unit, err := model.ResolveBillingUnit(actor.UserID)
 	if err != nil {
 		return nil, Failure(403, "BILLING_IDENTITY_UNAVAILABLE", "Billing identity is unavailable")
@@ -204,6 +207,18 @@ func PrepareCall(serverID, toolName string, actor *Actor, arguments map[string]a
 }
 
 func (call *PreparedCall) Run(ctx context.Context, progress Progress) (*mcpsdk.CallToolResult, error) {
+	if call.actor.DelegationToken != "" {
+		verified, err := AuthenticateDelegation(ctx, "Bearer "+call.actor.DelegationToken)
+		if err != nil || verified.UserID != call.actor.UserID || !verified.Delegation.AllowsServer(call.server.ID) {
+			if err == nil {
+				err = Failure(403, "DELEGATION_ACCESS_DENIED", "MCP delegation is no longer available")
+			}
+			if call.Created {
+				return call.fail(err, false)
+			}
+			return nil, err
+		}
+	}
 	if !call.Created {
 		return AuthorizedInvocationResult(ctx, call.Invocation, call.actor, call.options.Test)
 	}
@@ -266,7 +281,7 @@ func (call *PreparedCall) Run(ctx context.Context, progress Progress) (*mcpsdk.C
 	}
 	// Requests lasting over 30 seconds recheck OAuth grant state while active.
 	// A failed check cancels only the transport, never the already-created task.
-	if call.actor.AccessToken != "" && (!call.server.Catalog || call.server.Kind != "remote_mcp") {
+	if call.actor.DelegationToken != "" || call.actor.AccessToken != "" && (!call.server.Catalog || call.server.Kind != "remote_mcp") {
 		go call.monitorAuthorization(ctx, cancel)
 	}
 	outcome, err := ExecuteAdapter(ctx, call.server, call.tool, call.actor, call.args, call.options.IdempotencyKey, progress)
@@ -323,6 +338,12 @@ func (call *PreparedCall) Run(ctx context.Context, progress Progress) (*mcpsdk.C
 		}
 	}
 	attachBilling(outcome.Result, call.Invocation)
+	if call.actor.DelegationToken != "" {
+		if _, err := AuthenticateDelegation(ctx, "Bearer "+call.actor.DelegationToken); err != nil {
+			// Executed work stays durably settled, but revoked callers receive no result.
+			return nil, err
+		}
+	}
 	return outcome.Result, nil
 }
 
@@ -334,9 +355,17 @@ func (call *PreparedCall) monitorAuthorization(ctx context.Context, cancel conte
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := AuthenticateOAuth(ctx, call.server, call.actor.AccessToken); err != nil {
-				cancel()
-				return
+			if call.actor.DelegationToken != "" {
+				if _, err := AuthenticateDelegation(ctx, "Bearer "+call.actor.DelegationToken); err != nil {
+					cancel()
+					return
+				}
+			}
+			if call.actor.AccessToken != "" && (!call.server.Catalog || call.server.Kind != "remote_mcp") {
+				if _, err := AuthenticateOAuth(ctx, call.server, call.actor.AccessToken); err != nil {
+					cancel()
+					return
+				}
 			}
 		}
 	}

@@ -85,6 +85,7 @@ export function TestPanel({
     mutationFn: () =>
       mcpRequest<{ authorization_url: string }>(authorizationPath, 'POST'),
     onSuccess: (value) => {
+      sessionStorage.removeItem('mcp-authorization-return')
       window.location.assign(value.authorization_url)
     },
     onError: (error) => handleServerError(error),

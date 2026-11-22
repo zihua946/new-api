@@ -9,7 +9,6 @@ import (
 )
 
 func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
-	truncateTables(t)
 	useUserCacheMiniRedis(t)
 	token := Token{
 		Id:         42,
@@ -20,7 +19,6 @@ func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 		AutoGroups: `["vip","default"]`,
 	}
 
-	require.NoError(t, DB.Create(&token).Error)
 	require.NoError(t, cacheSetTokenForTest(token))
 	cached, err := cacheGetTokenByKey(token.Key)
 	require.NoError(t, err)

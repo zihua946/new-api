@@ -154,12 +154,6 @@ export function MCPManagement() {
       cell: ({ row }) => (row.original.enabled ? t('Enabled') : t('Disabled')),
     },
     {
-      accessorKey: 'auth_mode',
-      header: t('Authentication'),
-      cell: ({ row }) =>
-        row.original.auth_mode === 'oauth2' ? 'OAuth2' : t('No authentication'),
-    },
-    {
       id: 'actions',
       header: t('Actions'),
       cell: ({ row }) => (
@@ -334,26 +328,6 @@ function ServerDetail({
     queryFn: () => mcpRequest<MCPServer>(`/servers/${id}`),
   })
   const client = useQueryClient()
-  const authorize = useMutation({
-    mutationFn: () =>
-      mcpRequest<{ authorization_url: string }>(
-        `/servers/${id}/discovery-authorization`,
-        'POST'
-      ),
-    onSuccess: ({ authorization_url }) =>
-      window.location.assign(authorization_url),
-    onError: (error) => handleServerError(error),
-  })
-  const test = useMutation({
-    mutationFn: () =>
-      mcpRequest<{ version?: string; protocol_version?: string }>(
-        `/servers/${id}/connection-tests`,
-        'POST'
-      ),
-    onSettled: () =>
-      client.invalidateQueries({ queryKey: ['mcp', 'server', id] }),
-    onError: (error) => handleServerError(error),
-  })
   const download = useMutation({
     mutationFn: () =>
       mcpRequest(`/servers/${id}/package`, 'POST', {
@@ -362,8 +336,7 @@ function ServerDetail({
     onSuccess: () => client.invalidateQueries({ queryKey: ['mcp'] }),
     onError: (e) => handleServerError(e),
   })
-  const detectedVersion =
-    test.data?.version ?? server.data?.connection_health?.version
+  const detectedVersion = server.data?.connection_health?.version
   const useVersion = useMutation({
     mutationFn: (version: string) =>
       mcpRequest(`/servers/${id}`, 'PATCH', {
@@ -431,32 +404,7 @@ function ServerDetail({
                     {t('Edit configuration')}
                   </Button>
                 )}
-                {operate && server.data.auth_mode === 'oauth2' && (
-                  <Button
-                    variant='outline'
-                    disabled={authorize.isPending}
-                    onClick={() => authorize.mutate()}
-                  >
-                    {t('Authorize')}
-                  </Button>
-                )}
-                {operate && (
-                  <Button
-                    variant='outline'
-                    disabled={test.isPending}
-                    onClick={() => test.mutate()}
-                  >
-                    {t('Test connection')}
-                  </Button>
-                )}
               </div>
-              {server.data.connection_health && (
-                <p className='text-muted-foreground text-sm'>
-                  {server.data.connection_health.connected
-                    ? t('Connected')
-                    : t('Failed')}
-                </p>
-              )}
               {detectedVersion && (
                 <div className='flex items-center gap-2 text-sm'>
                   <span>

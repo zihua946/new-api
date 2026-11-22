@@ -3,7 +3,6 @@ package model
 import (
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -833,7 +832,7 @@ func PurchaseSubscriptionWithBalance(userId int, planId int) error {
 	}
 
 	if chargedQuota > 0 {
-		if err := invalidateUserCache(userId); err != nil {
+		if err := cacheDecrUserQuota(userId, int64(chargedQuota)); err != nil {
 			common.SysLog("failed to decrease user quota cache after subscription balance purchase: " + err.Error())
 		}
 	}
@@ -1306,12 +1305,11 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 	if amount <= 0 {
 		return nil, errors.New("amount must be > 0")
 	}
-	return preConsumeSubscription(DB, requestId, userId, amount, GetDBTimestamp())
-}
-func preConsumeSubscription(db *gorm.DB, requestId string, userId int, amount, now int64) (*SubscriptionPreConsumeResult, error) {
+	now := GetDBTimestamp()
+
 	returnValue := &SubscriptionPreConsumeResult{}
 
-	err := db.Transaction(func(tx *gorm.DB) error {
+	err := DB.Transaction(func(tx *gorm.DB) error {
 		var existing SubscriptionPreConsumeRecord
 		query := tx.Where("request_id = ?", requestId).Limit(1).Find(&existing)
 		if query.Error != nil {
@@ -1338,7 +1336,7 @@ func preConsumeSubscription(db *gorm.DB, requestId string, userId int, amount, n
 			Where("user_id = ? AND status = ? AND end_time > ?", userId, "active", now).
 			Order("end_time asc, id asc").
 			Find(&subs).Error; err != nil {
-			return err
+			return ErrNoActiveSubscription
 		}
 		if len(subs) == 0 {
 			return ErrNoActiveSubscription
@@ -1381,9 +1379,6 @@ func preConsumeSubscription(db *gorm.DB, requestId string, userId int, amount, n
 				}
 				return err
 			}
-			if sub.AmountUsed > math.MaxInt64-amount {
-				return ErrSubscriptionQuotaInsufficient
-			}
 			sub.AmountUsed += amount
 			if err := tx.Save(&sub).Error; err != nil {
 				return err
@@ -1408,10 +1403,7 @@ func RefundSubscriptionPreConsume(requestId string) error {
 	if strings.TrimSpace(requestId) == "" {
 		return errors.New("requestId is empty")
 	}
-	return refundSubscription(DB, requestId)
-}
-func refundSubscription(db *gorm.DB, requestId string) error {
-	return db.Transaction(func(tx *gorm.DB) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
 		var record SubscriptionPreConsumeRecord
 		if err := lockForUpdate(tx).
 			Where("request_id = ?", requestId).First(&record).Error; err != nil {
@@ -1424,7 +1416,7 @@ func refundSubscription(db *gorm.DB, requestId string) error {
 			record.Status = "refunded"
 			return tx.Save(&record).Error
 		}
-		if err := postSubscriptionDelta(tx, record.UserSubscriptionId, -record.PreConsumed); err != nil {
+		if err := PostConsumeUserSubscriptionDelta(record.UserSubscriptionId, -record.PreConsumed); err != nil {
 			return err
 		}
 		record.Status = "refunded"
@@ -1522,24 +1514,20 @@ func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error
 	if delta == 0 {
 		return nil
 	}
-	return DB.Transaction(func(tx *gorm.DB) error { return postSubscriptionDelta(tx, userSubscriptionId, delta) })
-}
-func postSubscriptionDelta(tx *gorm.DB, userSubscriptionId int, delta int64) error {
-	var sub UserSubscription
-	if err := lockForUpdate(tx).
-		Where("id = ?", userSubscriptionId).
-		First(&sub).Error; err != nil {
-		return err
-	}
-	if delta > 0 && sub.AmountUsed > math.MaxInt64-delta {
-		return ErrSubscriptionQuotaInsufficient
-	}
-	newUsed := max(sub.AmountUsed+delta, 0)
-	if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
-		return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
-	}
-	sub.AmountUsed = newUsed
-	return tx.Save(&sub).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var sub UserSubscription
+		if err := lockForUpdate(tx).
+			Where("id = ?", userSubscriptionId).
+			First(&sub).Error; err != nil {
+			return err
+		}
+		newUsed := max(sub.AmountUsed+delta, 0)
+		if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
+			return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
+		}
+		sub.AmountUsed = newUsed
+		return tx.Save(&sub).Error
+	})
 }
 
 var ErrNoActiveSubscription = errors.New("no active subscription")

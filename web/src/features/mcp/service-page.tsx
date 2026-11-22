@@ -36,6 +36,7 @@ export function ServicePage(props: {
   manage: boolean
   tab: 'readme' | 'tools'
   onTabChange: (tab: 'readme' | 'tools') => void
+  onReturnToMarketplace?: (error?: string) => void
 }) {
   const { t } = useTranslation()
   const client = useQueryClient()
@@ -51,16 +52,21 @@ export function ServicePage(props: {
       : 'done'
   )
   const [reason, setReason] = useState('')
-  const [returnToClient] = useState(
-    () =>
-      callback === 'pending' &&
-      sessionStorage.getItem('mcp-return-installation') === props.id
+  const [authorizationReturn] = useState(() =>
+    callback === 'pending'
+      ? sessionStorage.getItem('mcp-authorization-return')
+      : null
   )
+  const marketplaceReturn = authorizationReturn === `marketplace:${props.id}`
+  const popupReturn = authorizationReturn === `popup:${props.id}`
+  const serverID = props.id
+  const onReturnToMarketplace = props.onReturnToMarketplace
   const redeemed = useRef(false)
   useEffect(() => {
     if (redeemed.current || callback !== 'pending') return
     redeemed.current = true
     sessionStorage.removeItem('mcp-return-installation')
+    sessionStorage.removeItem('mcp-authorization-return')
     const hash = new URLSearchParams(window.location.hash.slice(1))
     window.history.replaceState(
       window.history.state,
@@ -75,22 +81,42 @@ export function ServicePage(props: {
       .then(async () => {
         await client.invalidateQueries({ queryKey: ['mcp'] })
         setCallback('done')
+        if (popupReturn) {
+          if (typeof BroadcastChannel !== 'undefined') {
+            const channel = new BroadcastChannel('mcp-authorization')
+            channel.postMessage({ server_id: serverID, success: true })
+            channel.close()
+          }
+          window.close()
+        }
+        if (marketplaceReturn || popupReturn) onReturnToMarketplace?.()
       })
       .catch((e: unknown) => {
-        setReason(e instanceof Error ? e.message : t('Authorization required'))
+        const error =
+          e instanceof Error ? e.message : t('Authorization required')
+        setReason(error)
         setCallback('failed')
+        if (popupReturn && typeof BroadcastChannel !== 'undefined') {
+          const channel = new BroadcastChannel('mcp-authorization')
+          channel.postMessage({ server_id: serverID, success: false, error })
+          channel.close()
+        }
+        if (marketplaceReturn) onReturnToMarketplace?.(error)
       })
-  }, [client, callback, t])
+  }, [
+    client,
+    callback,
+    t,
+    marketplaceReturn,
+    popupReturn,
+    serverID,
+    onReturnToMarketplace,
+  ])
   const install = useMutation({
     mutationFn: () =>
       mcpRequest('/self/installations', 'POST', { server_id: props.id }),
     onSuccess: () => detail.refetch(),
   })
-  const authenticationLabels: Record<string, string> = {
-    none: t('No authentication'),
-    engine_app: 'Casdoor',
-    oauth2: 'OAuth2',
-  }
   const server = detail.data
   return (
     <SectionPageLayout>
@@ -129,18 +155,12 @@ export function ServicePage(props: {
               <TabsTrigger value='tools'>{t('Tool testing')}</TabsTrigger>
             </TabsList>
             <TabsContent value='readme' className='space-y-4'>
-              <dl className='grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm'>
-                {server.version && (
-                  <>
-                    <dt>{t('Version')}</dt>
-                    <dd>{server.version}</dd>
-                  </>
-                )}
-                <dt>{t('Authentication')}</dt>
-                <dd>
-                  {authenticationLabels[server.auth_mode] ?? server.auth_mode}
-                </dd>
-              </dl>
+              {server.version && (
+                <dl className='grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm'>
+                  <dt>{t('Version')}</dt>
+                  <dd>{server.version}</dd>
+                </dl>
+              )}
               {server.readme ? (
                 <Markdown>{server.readme}</Markdown>
               ) : (
@@ -152,7 +172,7 @@ export function ServicePage(props: {
                 <LoadingState />
               ) : (
                 <>
-                  {returnToClient && (
+                  {popupReturn && (
                     <Button onClick={() => window.close()}>
                       {t('Return to MCP client')}
                     </Button>

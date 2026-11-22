@@ -28,6 +28,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { useAuthStore } from "@/stores/auth-store";
+import { useSystemConfigStore } from "@/stores/system-config-store";
 
 import { MCPManagement } from "..";
 import { InvocationList } from "../invocations";
@@ -36,6 +37,7 @@ import { MCPMarketplace } from "../marketplace";
 import { ServerForm } from "../server-form";
 import { ServicePage } from "../service-page";
 import { TestPanel } from "../test-panel";
+import { ToolPanel } from "../tool-panel";
 import {
   testPending,
   testRequest,
@@ -50,6 +52,10 @@ afterEach(() => {
   for (const client of clients) client.clear();
   clients.length = 0;
   request.mockReset();
+  sessionStorage.clear();
+  window.history.replaceState({}, "", "/");
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   useAuthStore.getState().auth.reset();
 });
 
@@ -71,6 +77,54 @@ function renderMCPTest(authMode = "engine_api_key") {
 }
 
 describe("MCP management page", () => {
+  it("omits authentication from the list and authorization and connection testing from management", async () => {
+    const user = userEvent.setup();
+    useAuthStore.getState().auth.setUser({ id: 1, username: "root", role: 100 });
+    const server = {
+      id: "remote-server",
+      name: "Search service",
+      description: "Search public pages",
+      enabled: true,
+      auth_mode: "oauth2",
+      connection_health: { connected: false, error_code: "REAUTHORIZATION_REQUIRED" },
+      connection: {
+        transport: "streamable_http",
+        url: "https://provider.test/mcp",
+      },
+    };
+    request.mockImplementation(async (path: string) =>
+      path.startsWith("/servers?")
+        ? { items: [server], page: 1, page_size: 20, total: 1 }
+        : server,
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    clients.push(client);
+    client.setQueryData(["status"], { mcp_enabled: true });
+    render(
+      <QueryClientProvider client={client}>
+        <MCPManagement />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("Search service");
+    expect(screen.queryByText("Authentication")).not.toBeInTheDocument();
+    expect(screen.queryByText("OAuth2")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Manage" }));
+    const detail = within(await screen.findByRole("dialog"));
+    expect(
+      await detail.findByRole("button", { name: "Edit configuration" }),
+    ).toBeVisible();
+    expect(
+      detail.queryByRole("button", { name: "Authorize" }),
+    ).not.toBeInTheDocument();
+    expect(
+      detail.queryByRole("button", { name: "Test connection" }),
+    ).not.toBeInTheDocument();
+    expect(detail.getByText("https://provider.test/mcp")).toBeVisible();
+    expect(detail.queryByText("Failed")).not.toBeInTheDocument();
+  });
+
   it("shows empty services and invocation history after MCP is enabled", async () => {
     const user = userEvent.setup();
     useAuthStore
@@ -96,13 +150,92 @@ describe("MCP management page", () => {
   });
 });
 
+describe("MCP tool pricing", () => {
+  it.each([null, {
+    mode: "per_success", currency: "USD", unit_price: "0.001",
+    unit_price_usd: "0.001", effective_credits: "0.001",
+    charge_quota: 500, quota_per_unit: 500000, price_revision: 1,
+  }])("opens explicit pricing controls and saves a price with existing pricing=%j", async (pricing) => {
+    const user = userEvent.setup();
+    const config = useSystemConfigStore.getState().config;
+    useSystemConfigStore.getState().setConfig({
+      currency: { ...config.currency, quotaDisplayType: "TOKENS" },
+    });
+    const tool = {
+      id: "tool-1", name: "web_search", description: "Search public pages",
+      revision: 3, enabled: false, input_schema: {}, output_schema: null, pricing,
+    };
+    request.mockResolvedValue([tool]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    clients.push(client);
+    try {
+      render(
+        <QueryClientProvider client={client}>
+          <ToolPanel server={{ id: "server-1" } as MCPServer} sensitive={false} operate write />
+        </QueryClientProvider>,
+      );
+      await user.click(await screen.findByRole("button", { name: "Edit price" }));
+      const dialog = within(await screen.findByRole("dialog"));
+      const price = dialog.getByRole("textbox", { name: "USD per successful call (0 is free)" });
+      await user.clear(price);
+      await user.type(price, "0.002");
+      await user.click(dialog.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(request).toHaveBeenCalledWith(
+        "/servers/server-1/tools/tool-1/pricing", "PUT",
+        { expected_revision: 3, mode: "per_success", unit_price: "0.002", currency: "USD" },
+      ));
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    } finally {
+      useSystemConfigStore.getState().setConfig(config);
+    }
+  });
+
+  it("disables price editing without either editing permission", async () => {
+    request.mockResolvedValue([{ id: "tool-1", name: "web_search", pricing: null }]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    clients.push(client);
+    render(
+      <QueryClientProvider client={client}>
+        <ToolPanel server={{ id: "server-1" } as MCPServer} sensitive={false} operate write={false} />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByRole("button", { name: "Edit price" })).toBeDisabled();
+  });
+
+  it.each([
+    ["USD", "0.001", "$0.001"],
+    ["CNY", "0.001", "¥0.001"],
+    ["USD", "0", "$0"],
+  ])("shows only the configured %s amount %s", async (currency, unitPrice, expected) => {
+    request.mockResolvedValue([{
+      id: "tool-1", name: "web_search", description: "Search",
+      pricing: { currency, unit_price: unitPrice, unit_price_usd: "0.000136",
+        charge_quota: 68, effective_credits: "0.000136", quota_per_unit: 500000 },
+    }]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    clients.push(client);
+    render(
+      <QueryClientProvider client={client}>
+        <ToolPanel server={{ id: "server-1" } as MCPServer} sensitive={false} operate write />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText(expected)).toBeVisible();
+    expect(screen.queryByText(/Credits|quota/)).not.toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole("button", { name: "Edit price" }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByText(expected)).toBeVisible();
+    expect(dialog.queryByText(/Credits|quota/)).not.toBeInTheDocument();
+  });
+});
+
 describe("MCP marketplace", () => {
-  it("opens a sanitized README and lists tools without calling them", async () => {
+  it("shows version and sanitized README without authentication type and lists tools without calling them", async () => {
     const server = {
       id: "one",
       name: "Manual",
+      version: "1.0.0",
       readme: "# Guide\n<script>bad()</script>",
-      auth_mode: "none",
+      auth_mode: "oauth2",
       kind: "remote_mcp",
       installation: { id: "owned", authorized: true },
       limits: { timeout_seconds: 60 },
@@ -122,6 +255,9 @@ describe("MCP marketplace", () => {
     );
     const view = render(page("readme"));
     expect(await screen.findByRole("heading", { name: "Guide" })).toBeVisible();
+    expect(screen.getByText("1.0.0")).toBeVisible();
+    expect(screen.queryByText("Authentication")).not.toBeInTheDocument();
+    expect(screen.queryByText("OAuth2")).not.toBeInTheDocument();
     expect(view.container.querySelector("script")).toBeNull();
     screen.getByRole("tab", { name: "Service configuration" }).focus();
     await userEvent.setup().keyboard("{ArrowRight}{Enter}");
@@ -132,35 +268,44 @@ describe("MCP marketplace", () => {
     );
     expect(request.mock.calls.every((entry) => entry[1] !== "POST")).toBe(true);
   });
-  it("keeps marketplace authorization controls and reveals secondary actions on interaction", async () => {
-    request.mockResolvedValue({
+  it("shows version without authentication labels and keeps connection controls without uninstall", async () => {
+    const catalogItems = {
       items: [
         {
           id: "offline",
           name: "Offline",
           enabled: true,
           auth_mode: "none",
+          client_connection: { type: "streamable-http", url: "https://gateway.test/mcp/offline" },
           installation: { id: "installation-2", authorized: false },
         },
         {
           id: "new-service",
           name: "New service",
+          client_connection: { type: "streamable-http", url: "https://gateway.test/mcp/new-service" },
           enabled: true,
           auth_mode: "oauth2",
         },
         {
           id: "remote-server",
+          version: "1.0.0",
           name: "Search",
           description: "Search tools",
           enabled: true,
           auth_mode: "oauth2",
           url: "https://gateway.test/mcp/remote-server",
+          client_connection: { type: "streamable-http", url: "https://provider.test/mcp" },
           installation: { id: "installation-1", authorized: true },
         },
       ],
       total: 1,
       page: 1,
       page_size: 24,
+    };
+    request.mockImplementation(async (path: string, method?: string) => {
+      if (method === "POST" && path === "/self/installations") return { id: "new-installation", authorized: false };
+      if (method === "POST") return {};
+      return catalogItems;
     });
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false } },
@@ -176,23 +321,36 @@ describe("MCP marketplace", () => {
       </QueryClientProvider>,
     );
     expect(await screen.findByText("Connected")).toBeVisible();
+    expect(screen.getByText("1.0.0")).toBeVisible();
+    expect(screen.queryByText(/OAuth2|No authentication/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Uninstall" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Authorize" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Copy connection configuration" })).toBeNull();
-    const uninstall = screen.getAllByRole("button", { name: "Uninstall" })[1];
-    expect(uninstall).toHaveClass("text-destructive");
-    expect(uninstall).toHaveClass("pointer-events-none", "opacity-0", "group-hover/card:opacity-100", "group-focus-within/card:opacity-100", "[@media(hover:none)]:opacity-100");
-    expect(screen.getByRole("link", { name: "Test" })).toHaveAttribute(
-      "href",
-      "/mcp/servers/remote-server?tab=tools",
-    );
+    const copyUser = userEvent.setup();
+    const clipboard = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    const cards = ["Offline", "Search"].map((name) => screen.getByRole("link", { name }).closest('[data-slot="card"]') as HTMLElement);
+    for (const card of cards) {
+      expect(within(card).getByRole("button", { name: "Copy to clipboard" })).toBeVisible();
+      expect(within(card).getByRole("button", { name: "Reset" })).toBeVisible();
+      expect(within(card).getByRole("switch")).toBeVisible();
+    }
+    const newCard = screen.getByRole("link", { name: "New service" }).closest('[data-slot="card"]') as HTMLElement;
+    expect(within(newCard).getByRole("button", { name: "Copy to clipboard" })).toBeVisible();
+    expect(within(newCard).getByRole("button", { name: "Reset" })).toBeDisabled();
+    expect(within(newCard).getByRole("switch")).not.toBeChecked();
+    await copyUser.click(within(cards[1]).getByRole("button", { name: "Copy to clipboard" }));
+    expect(JSON.parse(clipboard.mock.calls[0][0])).toEqual({
+      mcpServers: { Search: { type: "streamable-http", url: "https://provider.test/mcp" } },
+    });
+    expect(screen.queryByRole("link", { name: "Test" })).toBeNull();
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "Install" }));
+      .click(screen.getByRole("switch", { name: "New service" }));
     await waitFor(() =>
       expect(request).toHaveBeenCalledWith("/self/installations", "POST", {
         server_id: "new-service",
       }),
     );
+    await waitFor(() => expect(request).toHaveBeenCalledWith("/self/installations/new-installation/enable", "POST"));
     expect(
       request.mock.calls.some((call) => call[0].endsWith("/authorization")),
     ).toBe(false);
@@ -204,7 +362,7 @@ describe("MCP marketplace", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     await user.click(screen.getByRole("switch", { name: "Search" }));
     expect(
-      screen.getByRole("button", { name: "Reset" }),
+      within(cards[1]).getByRole("button", { name: "Reset" }),
     ).toBeVisible();
     expect(screen.queryByRole("dialog")).toBeNull();
     await waitFor(() =>
@@ -213,44 +371,164 @@ describe("MCP marketplace", () => {
         "POST",
       ),
     );
-    uninstall.focus();
-    expect(uninstall).toHaveFocus();
-    await user.keyboard("{Enter}");
-    const confirmation = await screen.findByRole("alertdialog");
     expect(request).not.toHaveBeenCalledWith("/self/installations/installation-1", "DELETE");
-    await user.click(within(confirmation).getByRole("button", { name: "Uninstall" }));
-    await waitFor(() => expect(request).toHaveBeenCalledWith("/self/installations/installation-1", "DELETE"));
   });
-  it.each([true, false])("resets a server with authorized=%s by revoking its grant before starting authorization", async (authorized) => {
-    const popup = {
-      closed: false,
-      opener: null,
-      sessionStorage: window.sessionStorage,
-      location: { replace: vi.fn() },
-      close: vi.fn(),
-    };
-    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
-    request.mockResolvedValue({ authorization_url: "https://provider.test/authorize" });
+  it.each([true, false])("resets a server with authorized=%s without starting authorization", async (authorized) => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    request.mockResolvedValue({});
     const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     clients.push(client);
+    const item = { id: "server-1", name: "Search", description: "Search tools", auth_mode: "oauth2", enabled: true };
+    let connected = authorized;
+    request.mockImplementation(async (_path: string, method?: string) => {
+      if (method === "DELETE") connected = false;
+      return { items: [{ ...item, installation: { id: "installation-1", authorized: connected } }], total: 1 };
+    });
+    client.setQueryData(["mcp", "catalog", "all", "", 1], { items: [{ ...item, installation: { id: "installation-1", authorized } }], total: 1 });
+    const router = createRouter({
+      routeTree: createRootRoute({ component: MCPMarketplace }),
+      history: createMemoryHistory({ initialEntries: ["/"] }),
+    });
     render(
       <QueryClientProvider client={client}>
-        <InstallationConnection
-          compact
-          item={{ id: "server-1", name: "Search", description: "Search tools", auth_mode: "oauth2", enabled: true }}
-          installation={{ id: "installation-1", authorized }}
-        />
+        <RouterProvider router={router} />
       </QueryClientProvider>,
     );
-    await userEvent.setup().click(screen.getByRole("button", { name: "Reset" }));
-    await waitFor(() => expect(popup.location.replace).toHaveBeenCalledWith("https://provider.test/authorize"));
-    expect(request.mock.calls.slice(0, 2)).toEqual([
-      ["/self/installations/installation-1/authorization", "DELETE"],
-      ["/self/installations/installation-1/authorization", "POST"],
-    ]);
-    expect(screen.getByRole("status")).toHaveTextContent("Waiting for browser authorization");
-    expect(screen.queryByRole("button", { name: "Reset" })).toBeNull();
-    window.sessionStorage.removeItem("mcp-return-installation");
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Reset" }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith("/self/installations/installation-1/authorization", "DELETE"));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Search" })).not.toBeChecked());
+    expect(request.mock.calls.filter((call) => call[1] === "POST")).toEqual([]);
+    expect(open).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status")).toBeNull();
+    open.mockRestore();
+  });
+});
+
+describe("MCP authorization return", () => {
+  it.each([
+    ["popup", true], ["popup", false],
+    ["marketplace", true], ["marketplace", false],
+    ["detail", true], ["detail", false],
+  ] as const)("returns from %s authorization with success=%s", async (source, success) => {
+    const post = vi.fn();
+    vi.stubGlobal("BroadcastChannel", class {
+      postMessage = post;
+      close = vi.fn();
+    });
+    const close = vi.spyOn(window, "close").mockImplementation(() => {});
+    if (source !== "detail") sessionStorage.setItem("mcp-authorization-return", `${source}:one`);
+    window.history.replaceState({}, "", "/mcp/servers/one?tab=tools#mcp_state=state&mcp_code=code&mcp_iss=issuer");
+    const server = { id: "one", name: "Search", kind: "remote_mcp", enabled: true, auth_mode: "oauth2", installation: { id: "installed", authorized: success }, limits: { timeout_seconds: 60 } };
+    request.mockImplementation(async (path: string) => {
+      if (path === "/oauth/callback") {
+        if (!success) throw new Error("Authorization denied");
+        return {};
+      }
+      return path.endsWith("test-tools") ? [] : server;
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    clients.push(client);
+    const returned = vi.fn();
+    render(<QueryClientProvider client={client}>
+      <ServicePage id="one" manage={false} tab="tools" onTabChange={vi.fn()} onReturnToMarketplace={returned} />
+    </QueryClientProvider>);
+    await waitFor(() => expect(request).toHaveBeenCalledWith("/oauth/callback", "POST", { state: "state", code: "code", issuer: "issuer" }));
+    if (!success) expect(await screen.findByRole("alert")).toHaveTextContent("Authorization denied");
+    if (source === "marketplace" || source === "popup" && success) {
+      await waitFor(() => expect(returned).toHaveBeenCalledWith(...(success ? [] : ["Authorization denied"])));
+    } else expect(returned).not.toHaveBeenCalled();
+    if (source === "popup") {
+      await waitFor(() => expect(post).toHaveBeenCalledWith(success
+        ? { server_id: "one", success: true }
+        : { server_id: "one", success: false, error: "Authorization denied" }));
+    } else expect(post).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(source === "popup" && success ? 1 : 0);
+    expect(window.location.hash).toBe("");
+    expect(sessionStorage.getItem("mcp-authorization-return")).toBeNull();
+    expect(request.mock.calls.filter(([path]) => path === "/oauth/callback")).toHaveLength(1);
+    close.mockRestore();
+  });
+
+  it("refreshes the original marketplace card from server state after popup authorization", async () => {
+    const replace = vi.fn();
+    const open = vi.spyOn(window, "open").mockReturnValue({ closed: false, close: vi.fn(), opener: null, location: { replace }, sessionStorage: { setItem: vi.fn() } } as unknown as Window);
+    let receive: ((event: MessageEvent) => void) | null = null;
+    vi.stubGlobal("BroadcastChannel", class {
+      addEventListener(_event: string, handler: (event: MessageEvent) => void) { receive = handler; }
+      close = vi.fn();
+    });
+    let authorized = false;
+    const item = { id: "one", name: "Search", description: "", auth_mode: "oauth2", enabled: true };
+    request.mockImplementation(async (path: string) => {
+      if (path.endsWith("/enable")) return { authorization_url: "https://issuer.test/authorize" };
+      const installation = { id: "installed", authorized };
+      return path.startsWith("/catalog?") ? { items: [{ ...item, installation }], total: 1 } : { ...item, installation };
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    clients.push(client);
+    const router = createRouter({ routeTree: createRootRoute({ component: MCPMarketplace }), history: createMemoryHistory({ initialEntries: ["/"] }) });
+    render(<QueryClientProvider client={client}><RouterProvider router={router} /></QueryClientProvider>);
+    await userEvent.setup().click(await screen.findByRole("switch", { name: "Search" }));
+    await screen.findByRole("status");
+    authorized = true;
+    act(() => receive?.(new MessageEvent("message", { data: { server_id: "one", success: true } })));
+    await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
+    expect(screen.getByRole("switch", { name: "Search" })).toBeChecked();
+    expect(replace).toHaveBeenCalledWith("https://issuer.test/authorize");
+    open.mockRestore();
+  });
+
+  it("records a same-tab marketplace return when the authorization popup is blocked", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    request.mockResolvedValue({ authorization_url: "https://issuer.test/authorize" });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    clients.push(client);
+    render(<QueryClientProvider client={client}>
+      <InstallationConnection compact returnToMarketplace item={{ id: "one", name: "Search", description: "", auth_mode: "oauth2", enabled: true }} installation={{ id: "installed", authorized: false }} />
+    </QueryClientProvider>);
+    await userEvent.setup().click(screen.getByRole("switch", { name: "Search" }));
+    await waitFor(() => expect(sessionStorage.getItem("mcp-authorization-return")).toBe("marketplace:one"));
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    open.mockRestore();
+  });
+
+  it.each(["denied", "closed"])("keeps the marketplace switch off when popup authorization is %s", async (outcome) => {
+    const popupStorage = new Map<string, string>();
+    const replace = vi.fn();
+    const popup = {
+      closed: false, opener: null, close: vi.fn(), location: { replace },
+      sessionStorage: { setItem: (key: string, value: string) => popupStorage.set(key, value) },
+    };
+    const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    let receive: ((event: MessageEvent) => void) | null = null;
+    vi.stubGlobal("BroadcastChannel", class {
+      addEventListener(_event: string, handler: (event: MessageEvent) => void) { receive = handler; }
+      close = vi.fn();
+    });
+    request.mockImplementation(async (path: string) => path.endsWith("/enable")
+      ? { authorization_url: "https://issuer.test/authorize" }
+      : { installation: { id: "installed", authorized: false } });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    clients.push(client);
+    render(<QueryClientProvider client={client}>
+      <InstallationConnection compact returnToMarketplace item={{ id: "one", name: "Search", description: "", auth_mode: "oauth2", enabled: true }} installation={{ id: "installed", authorized: false }} />
+    </QueryClientProvider>);
+    await userEvent.setup().click(screen.getByRole("switch", { name: "Search" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("https://issuer.test/authorize"));
+    expect(popupStorage.get("mcp-authorization-return")).toBe("popup:one");
+    await screen.findByRole("status");
+    act(() => receive?.(new MessageEvent("message", { data: { server_id: "other", success: false, error: "Unrelated failure" } })));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    if (outcome === "denied") {
+      act(() => receive?.(new MessageEvent("message", { data: { server_id: "one", success: false, error: "Authorization denied" } })));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Authorization denied");
+    } else {
+      popup.closed = true;
+      await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Authorization required"), { timeout: 3000 });
+    }
+    expect(screen.getByRole("switch", { name: "Search" })).not.toBeChecked();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    open.mockRestore();
   });
 });
 
@@ -535,6 +813,38 @@ describe("MCP configuration and charge confirmation", () => {
       limits: { timeout_seconds: 60, max_concurrency: 10 },
     });
   });
+  it.each(["", "replacement-secret"])("saves automatic scope discovery with client secret input %j", async (secret) => {
+    request.mockResolvedValue({ callback_url: "https://gateway.test/api/mcp/oauth/callback" });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    clients.push(client);
+    const closed = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <QueryClientProvider client={client}>
+        <ServerForm sensitive onClose={closed} server={{
+          id: "scope-server", name: "Remote tools", description: "", version: "1", revision: 3,
+          kind: "remote_mcp", credentials_configured: true, connection: { transport: "streamable_http", url: "https://service.test/mcp", client_id: "registered", scopes: "user" },
+          limits: { timeout_seconds: 60, max_concurrency: 10 },
+        } as MCPServer} />
+      </QueryClientProvider>,
+    );
+    await user.click(screen.getByText("Advanced settings"));
+    await screen.findByLabelText("Client ID");
+    expect(screen.queryByLabelText(/OAuth scopes/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Clear client secret" })).not.toBeInTheDocument();
+    if (secret) await user.type(screen.getByLabelText("Client Secret"), secret);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(closed).toHaveBeenCalled());
+    expect(request).toHaveBeenCalledWith("/servers/scope-server", "PATCH", expect.objectContaining({
+      connection: { transport: "streamable_http", url: "https://service.test/mcp", client_id: "registered", scopes: "" },
+    }));
+    const saved = request.mock.calls.find(([path, method]) => path === "/servers/scope-server" && method === "PATCH")?.[2];
+    if (secret) {
+      expect(saved).toHaveProperty("client_secret", secret);
+    } else {
+      expect(saved).not.toHaveProperty("client_secret");
+    }
+  });
   it("binds real test approval to the displayed tool revision and charge", () => {
     const tool = {
       name: "web_search",
@@ -571,7 +881,7 @@ describe("MCP configuration and charge confirmation", () => {
   });
 });
 
-it("saves edited remote service metadata without an authentication selector", async () => {
+it("saves edited metadata and README text without authentication or README import controls", async () => {
   const server = {
     id: "edit-service", name: "Remote service", description: "Before",
     version: "1.0.0", kind: "remote_mcp", auth_mode: "none", revision: 2,
@@ -585,11 +895,14 @@ it("saves edited remote service metadata without an authentication selector", as
   render(<QueryClientProvider client={client}><ServerForm server={server} sensitive onClose={close} /></QueryClientProvider>);
   const user = userEvent.setup();
   expect(screen.queryByLabelText("Authentication")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Import Markdown")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("Upload PNG icon")).toBeInTheDocument();
+  await user.type(screen.getByRole("textbox", { name: "README" }), "# Updated service guide");
   await user.clear(screen.getByLabelText("Description"));
   await user.type(screen.getByLabelText("Description"), "After");
   await user.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(close).toHaveBeenCalled());
-  expect(request).toHaveBeenCalledWith("/servers/edit-service", "PATCH", expect.objectContaining({ description: "After", expected_revision: 2 }));
+  expect(request).toHaveBeenCalledWith("/servers/edit-service", "PATCH", expect.objectContaining({ description: "After", readme: "# Updated service guide", expected_revision: 2 }));
   const saved = request.mock.calls.find(([path]) => path === "/servers/edit-service");
   expect(saved?.[2]).not.toHaveProperty("auth_mode");
 });

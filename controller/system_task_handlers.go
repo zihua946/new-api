@@ -25,25 +25,6 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
 	service.RegisterSystemTaskHandler(lianlianReconcileHandler{})
 	service.RegisterSystemTaskHandler(mcpReconcileHandler{})
-	service.RegisterSystemTaskHandler(quotaReconcileHandler{})
-}
-
-type quotaReconcileHandler struct{}
-
-func (quotaReconcileHandler) Type() string { return "quota_reconcile" }
-func (quotaReconcileHandler) Enabled() bool {
-	var count int64
-	return model.DB.Model(&model.QuotaOperation{}).Where("state = ?", "pending").Limit(1).Count(&count).Error == nil && count > 0
-}
-func (quotaReconcileHandler) Interval() time.Duration { return 15 * time.Second }
-func (quotaReconcileHandler) NewPayload() any         { return nil }
-func (quotaReconcileHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
-	count, err := model.RecoverQuotaOperations(ctx, time.Now().UTC())
-	status := model.SystemTaskStatusSucceeded
-	if err != nil {
-		status = model.SystemTaskStatusFailed
-	}
-	finishSystemTaskHandler(task, runnerID, status, map[string]any{"reconciled": count}, err)
 }
 
 type mcpReconcileHandler struct{}

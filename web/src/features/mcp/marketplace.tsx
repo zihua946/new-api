@@ -1,15 +1,14 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
-import { Trash2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import { ConfirmDialog } from '@/components/confirm-dialog'
+import { CopyButton } from '@/components/copy-button'
 import { EmptyState } from '@/components/empty-state'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { Badge } from '@/components/ui/badge'
-import { Button, buttonVariants } from '@/components/ui/button'
+import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
@@ -34,6 +33,7 @@ type CatalogItem = {
   version: string
   auth_mode: 'oauth2' | 'none' | 'engine_app'
   enabled: boolean
+  client_connection?: { type: 'streamable-http' | 'sse'; url: string }
   url?: string
   icon?: string
   installation?: Installation
@@ -46,7 +46,12 @@ export function MCPMarketplace() {
   const [name, setName] = useState('')
   const [tab, setTab] = useState('all')
   const [page, setPage] = useState(1)
-  const [removing, setRemoving] = useState<CatalogItem | null>(null)
+  const [authorizationError] = useState(() =>
+    sessionStorage.getItem('mcp-authorization-error')
+  )
+  useEffect(() => {
+    sessionStorage.removeItem('mcp-authorization-error')
+  }, [])
   const callbackStarted = useRef(false)
   const catalog = useQuery({
     queryKey: ['mcp', 'catalog', tab, name, page],
@@ -54,25 +59,6 @@ export function MCPMarketplace() {
       mcpRequest<MCPPage<CatalogItem>>(
         `${tab === 'installed' ? '/self/installations' : '/catalog'}?${new URLSearchParams({ p: String(page), page_size: '24', name })}`
       ),
-  })
-  const change = useMutation({
-    mutationFn: async (action: { item: CatalogItem; remove?: boolean }) => {
-      const { item } = action
-      if (action.remove && item.installation) {
-        await mcpRequest(
-          `/self/installations/${item.installation.id}`,
-          'DELETE'
-        )
-        return
-      }
-      if (!item.installation) {
-        await mcpRequest('/self/installations', 'POST', { server_id: item.id })
-        return
-      }
-    },
-    onSettled: () => client.invalidateQueries({ queryKey: ['mcp', 'catalog'] }),
-    onSuccess: () => setRemoving(null),
-    onError: (error) => handleServerError(error),
   })
 
   useEffect(() => {
@@ -99,6 +85,7 @@ export function MCPMarketplace() {
       <h1 className='text-2xl font-semibold tracking-tight'>
         {t('MCP Marketplace')}
       </h1>
+      {authorizationError && <p role='alert'>{authorizationError}</p>}
       <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
         <Tabs
           value={tab}
@@ -143,16 +130,11 @@ export function MCPMarketplace() {
                   </span>
                   <div className='min-w-0 flex-1 space-y-1'>
                     <CardTitle className='break-words'>{item.name}</CardTitle>
-                    <p className='text-muted-foreground text-xs'>
-                      {[
-                        item.version,
-                        item.auth_mode !== 'none'
-                          ? 'OAuth2'
-                          : t('No authentication'),
-                      ]
-                        .filter(Boolean)
-                        .join(' · ')}
-                    </p>
+                    {item.version && (
+                      <p className='text-muted-foreground text-xs'>
+                        {item.version}
+                      </p>
+                    )}
                   </div>
                   {item.installation && (
                     <Badge variant='secondary'>
@@ -177,48 +159,22 @@ export function MCPMarketplace() {
               {!item.enabled && (
                 <Badge variant='outline'>{t('Unavailable')}</Badge>
               )}
-              {!item.installation && item.enabled && (
-                <Button
+              {item.client_connection && (
+                <CopyButton
+                  value={JSON.stringify(
+                    { mcpServers: { [item.name]: item.client_connection } },
+                    null,
+                    2
+                  )}
                   size='sm'
-                  disabled={change.isPending}
-                  onClick={() => change.mutate({ item })}
-                >
-                  {t('Install')}
-                </Button>
-              )}
-              {item.url && (
-                <a
-                  className={buttonVariants({
-                    size: 'sm',
-                    variant: 'ghost',
-                    className:
-                      'pointer-events-none opacity-0 group-focus-within/card:pointer-events-auto group-focus-within/card:opacity-100 group-hover/card:pointer-events-auto group-hover/card:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100',
-                  })}
-                  href={`/mcp/servers/${item.id}?tab=tools`}
-                >
-                  {t('Test')}
-                </a>
-              )}
-              {item.installation && (
-                <Button
-                  size='icon-sm'
-                  variant='ghost'
-                  aria-label={t('Uninstall')}
-                  title={t('Uninstall')}
-                  className='text-destructive hover:bg-destructive/10 hover:text-destructive pointer-events-none opacity-0 group-focus-within/card:pointer-events-auto group-focus-within/card:opacity-100 group-hover/card:pointer-events-auto group-hover/card:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100'
-                  disabled={change.isPending}
-                  onClick={() => setRemoving(item)}
-                >
-                  <Trash2 aria-hidden='true' />
-                </Button>
-              )}
-              {item.installation && (
-                <InstallationConnection
-                  item={item}
-                  installation={item.installation}
-                  compact
                 />
               )}
+              <InstallationConnection
+                item={item}
+                installation={item.installation}
+                compact
+                returnToMarketplace
+              />
             </CardFooter>
           </Card>
         ))}
@@ -240,20 +196,6 @@ export function MCPMarketplace() {
             {t('Next page')}
           </Button>
         </div>
-      )}
-      {removing && (
-        <ConfirmDialog
-          open
-          onOpenChange={(open) => {
-            if (!open) setRemoving(null)
-          }}
-          title={t('Uninstall')}
-          desc={removing.name}
-          confirmText={t('Uninstall')}
-          destructive
-          isLoading={change.isPending}
-          handleConfirm={() => change.mutate({ item: removing, remove: true })}
-        />
       )}
     </main>
   )

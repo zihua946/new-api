@@ -113,7 +113,10 @@ func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int) 
 		return nil, err
 	}
 
-	syncCreditUserQuotaCache(userId, quotaAwarded, "checkin")
+	// 事务成功后，异步更新缓存
+	go func() {
+		_ = cacheIncrUserQuota(userId, int64(quotaAwarded))
+	}()
 
 	return checkin, nil
 }

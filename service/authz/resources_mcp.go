@@ -14,7 +14,7 @@ func init() {
 		Resource: ResourceMCP, LabelKey: "MCP Services",
 		Actions: []ActionDefinition{
 			{Action: ActionRead, LabelKey: "View MCP services and usage", DefaultRoles: []string{BuiltInRoleAdmin}},
-			{Action: ActionWrite, LabelKey: "Edit MCP service descriptions", DefaultRoles: []string{BuiltInRoleAdmin}},
+			{Action: ActionWrite, LabelKey: "Edit MCP service descriptions and prices", DefaultRoles: []string{BuiltInRoleAdmin}},
 			{Action: ActionOperate, LabelKey: "Operate and test MCP services", DefaultRoles: []string{BuiltInRoleAdmin}},
 			{Action: ActionSensitiveWrite, LabelKey: "Edit MCP connections, credentials and prices"},
 		},

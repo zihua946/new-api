@@ -113,7 +113,7 @@ func TestRedisBatchReserveNeverFallsBackToStaleDatabaseBalance(t *testing.T) {
 	reserved, err := TryReserveUserQuota(user.Id, 8)
 	require.NoError(t, err)
 	assert.True(t, reserved)
-	assert.Equal(t, 2, getUserQuotaFromDB(t, user.Id), "balances bypass the statistics batch queue")
+	assert.Equal(t, 10, getUserQuotaFromDB(t, user.Id), "batch delta is not flushed yet")
 
 	reserved, err = TryReserveUserQuota(user.Id, 3)
 	require.NoError(t, err)
@@ -129,7 +129,7 @@ func TestRedisBatchReserveNeverFallsBackToStaleDatabaseBalance(t *testing.T) {
 	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 3, false)
 	require.NoError(t, err)
 	assert.False(t, reserved)
-	assert.Equal(t, 2, getTokenFromDB(t, token.Id).RemainQuota)
+	assert.Equal(t, 9, getTokenFromDB(t, token.Id).RemainQuota)
 
 	batchUpdate()
 	assert.Equal(t, 2, getUserQuotaFromDB(t, user.Id))
@@ -170,7 +170,7 @@ func TestBatchUpdateAccumulatorSaturatesOverflow(t *testing.T) {
 	batchUpdateLocks[BatchUpdateTypeUserQuota].Unlock()
 }
 
-func TestReserveFailsClosedWhenRedisIsUnavailable(t *testing.T) {
+func TestReserveFallsBackToDatabaseWhenRedisIsUnavailable(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
 	server := useUserCacheMiniRedis(t)
@@ -179,11 +179,16 @@ func TestReserveFailsClosedWhenRedisIsUnavailable(t *testing.T) {
 	require.NoError(t, populateUserCache(user))
 	server.Close()
 
+	// Redis 故障时降级为数据库条件更新：服务保持可用且不会超扣。
 	reserved, err := TryReserveUserQuota(user.Id, 5)
-	require.ErrorIs(t, err, ErrQuotaCacheUnavailable)
-	assert.False(t, reserved)
-	assert.Equal(t, 20, getUserQuotaFromDB(t, user.Id))
+	require.NoError(t, err)
+	assert.True(t, reserved)
+	assert.Equal(t, 15, getUserQuotaFromDB(t, user.Id))
 
+	reserved, err = TryReserveUserQuota(user.Id, 16)
+	require.NoError(t, err)
+	assert.False(t, reserved)
+	assert.Equal(t, 15, getUserQuotaFromDB(t, user.Id))
 }
 
 func TestSynchronousReserveCompensatesCacheWhenPersistenceFails(t *testing.T) {
@@ -225,14 +230,14 @@ func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.
 	require.NoError(t, err)
 	stale := *loaded
 
-	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 70, false)
+	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
 	require.NoError(t, err)
-	require.True(t, reserved)
+	require.Equal(t, cacheQuotaOK, result)
 
 	// 已存在的哈希只刷新 TTL：数据库快照不得覆盖已被原子预扣的余额。
 	code, err := cacheInitToken(stale)
 	require.NoError(t, err)
-	assert.Equal(t, 1, code)
+	assert.Equal(t, 2, code)
 	cached, err := cacheGetTokenByKey(token.Key)
 	require.NoError(t, err)
 	assert.Equal(t, 30, cached.RemainQuota)
@@ -249,8 +254,8 @@ func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.
 	server.FastForward(time.Duration(tokenCacheFenceSeconds+1) * time.Second)
 	fresh, err := GetTokenByKey(token.Key, false)
 	require.NoError(t, err)
-	assert.Equal(t, 30, fresh.RemainQuota)
+	assert.Equal(t, 100, fresh.RemainQuota)
 	cached, err = cacheGetTokenByKey(token.Key)
 	require.NoError(t, err)
-	assert.Equal(t, 30, cached.RemainQuota)
+	assert.Equal(t, 100, cached.RemainQuota)
 }

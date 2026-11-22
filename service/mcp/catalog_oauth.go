@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -126,8 +126,6 @@ type oauthFlow struct {
 	AppID    string
 }
 
-var resourceMetadataPattern = regexp.MustCompile(`(?i)resource_metadata\s*=\s*"([^"]+)"`)
-
 func oauthMetadata(ctx context.Context, endpoint string, out any) error {
 	client, err := NewHTTPClient(endpoint, 10*time.Second)
 	if err != nil {
@@ -174,18 +172,31 @@ func discoverOAuth(ctx context.Context, endpoint string) (oauthDiscovery, error)
 		return meta, fail
 	}
 	resp.Body.Close()
-	if resp.StatusCode == 401 {
-		if match := resourceMetadataPattern.FindStringSubmatch(resp.Header.Get("WWW-Authenticate")); len(match) == 2 {
-			parsed, err := ValidateEndpoint(match[1])
-			if err != nil || !strings.EqualFold(parsed.Scheme+"://"+parsed.Host, origin) {
-				return meta, fail
+	var scopes []string
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		challenges, err := oauthex.ParseWWWAuthenticate(resp.Header.Values("WWW-Authenticate"))
+		if err != nil {
+			return meta, fail
+		}
+		for _, challenge := range challenges {
+			if challenge.Scheme != "bearer" {
+				continue
 			}
-			resourceURL = match[1]
+			if metadataURL := challenge.Params["resource_metadata"]; metadataURL != "" {
+				parsed, err := ValidateEndpoint(metadataURL)
+				if err != nil || !strings.EqualFold(parsed.Scheme+"://"+parsed.Host, origin) {
+					return meta, fail
+				}
+				resourceURL = metadataURL
+			}
+			scopes = strings.Fields(challenge.Params["scope"])
+			break
 		}
 	}
 	var resource struct {
 		Resource string   `json:"resource"`
 		Issuers  []string `json:"authorization_servers"`
+		Scopes   []string `json:"scopes_supported"`
 	}
 	if oauthMetadata(ctx, resourceURL, &resource) != nil {
 		if resourceURL == origin+"/.well-known/oauth-protected-resource" || oauthMetadata(ctx, origin+"/.well-known/oauth-protected-resource", &resource) != nil {
@@ -194,6 +205,23 @@ func discoverOAuth(ctx context.Context, endpoint string) (oauthDiscovery, error)
 	}
 	if resource.Resource != endpoint || len(resource.Issuers) != 1 {
 		return meta, fail
+	}
+	if len(scopes) == 0 {
+		scopes = resource.Scopes
+	}
+	if len(strings.Join(scopes, " ")) > 2048 {
+		return meta, fail
+	}
+	for _, scope := range scopes {
+		if scope == "" {
+			return meta, fail
+		}
+		for _, c := range scope {
+			// OAuth scope-token syntax from RFC 6749 section 3.3.
+			if c < 0x21 || c > 0x7e || c == '"' || c == '\\' {
+				return meta, fail
+			}
+		}
 	}
 	issuer, err := ValidateEndpoint(resource.Issuers[0])
 	if err != nil {
@@ -214,6 +242,9 @@ func discoverOAuth(ctx context.Context, endpoint string) (oauthDiscovery, error)
 			return meta, fail
 		}
 	}
+	// An authorization server's scopes may cover unrelated resources. Only
+	// scopes advertised by this MCP resource belong in its authorization flow.
+	meta.Scopes = scopes
 	return meta, nil
 }
 
@@ -226,12 +257,14 @@ func oauthClient(server *model.MCPServer, meta oauthDiscovery) (*oauth2.Config, 
 			return nil, err
 		}
 	}
-	if server.Kind == "deepseek" && server.Catalog && server.CredentialCiphertext == "" && LocalProvider(server.Connection.URL) == "deepseek" && server.Connection.ClientID != "" && server.Connection.ClientID == os.Getenv("MCP_OAUTH_CLIENT_ID") {
+	if server.Kind == "deepseek" && server.Catalog {
 		issuer := strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")
 		if issuer == "" || issuer != meta.Issuer {
 			return nil, Failure(503, "MCP_NOT_CONFIGURED", "Configure the trusted MCP OAuth issuer")
 		}
-		secret = os.Getenv("MCP_OAUTH_CLIENT_SECRET")
+		if server.Connection.ClientID == "" || secret == "" {
+			return nil, Failure(401, "REAUTHORIZATION_REQUIRED", "Register and authorize this MCP client again")
+		}
 	}
 	style := oauth2.AuthStyleInParams
 	if secret != "" && (len(meta.Methods) == 0 || slices.Contains(meta.Methods, "client_secret_basic")) {
@@ -239,7 +272,11 @@ func oauthClient(server *model.MCPServer, meta oauthDiscovery) (*oauth2.Config, 
 	} else if secret != "" && !slices.Contains(meta.Methods, "client_secret_post") {
 		return nil, Failure(422, "INVALID_OAUTH_CONFIG", "Unsupported OAuth client authentication method")
 	}
-	return &oauth2.Config{ClientID: server.Connection.ClientID, ClientSecret: secret, Endpoint: oauth2.Endpoint{AuthURL: meta.AuthURL, TokenURL: meta.TokenURL, AuthStyle: style}, Scopes: strings.Fields(server.Connection.Scopes), RedirectURL: PublicBaseURL() + "/api/mcp/oauth/callback"}, nil
+	scopes := strings.Fields(server.Connection.Scopes)
+	if len(scopes) == 0 {
+		scopes = meta.Scopes
+	}
+	return &oauth2.Config{ClientID: server.Connection.ClientID, ClientSecret: secret, Endpoint: oauth2.Endpoint{AuthURL: meta.AuthURL, TokenURL: meta.TokenURL, AuthStyle: style}, Scopes: scopes, RedirectURL: PublicBaseURL() + "/api/mcp/oauth/callback"}, nil
 }
 
 func BeginAuthorization(ctx context.Context, row *model.MCPInstallation, sessionID string) (string, error) {
@@ -268,67 +305,11 @@ func BeginAuthorization(ctx context.Context, row *model.MCPInstallation, session
 		if err != nil {
 			return "", err
 		}
-		if server.Connection.ClientID == "" {
-			if flow.Metadata.RegistrationURL == "" {
-				return "", Failure(422, "OAUTH_CLIENT_REGISTRATION_REQUIRED", "Configure a registered OAuth client ID in advanced settings")
-			}
-			client, err := NewHTTPClient(flow.Metadata.RegistrationURL, 10*time.Second)
-			if err != nil {
-				return "", err
-			}
-			defer client.CloseIdleConnections()
-			method := "none"
-			if !slices.Contains(flow.Metadata.Methods, "none") && len(flow.Metadata.Methods) > 0 {
-				method = flow.Metadata.Methods[0]
-				if method != "client_secret_post" && method != "client_secret_basic" {
-					return "", Failure(422, "INVALID_OAUTH_CONFIG", "Unsupported OAuth client authentication method")
-				}
-			}
-			body, err := common.Marshal(map[string]any{
-				"client_name":                "New API MCP",
-				"redirect_uris":              []string{PublicBaseURL() + "/api/mcp/oauth/callback"},
-				"grant_types":                []string{"authorization_code", "refresh_token"},
-				"response_types":             []string{"code"},
-				"token_endpoint_auth_method": method,
-			})
-			if err != nil {
-				return "", err
-			}
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, flow.Metadata.RegistrationURL, bytes.NewReader(body))
-			if err != nil {
-				return "", err
-			}
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := client.Do(req)
-			if err != nil {
-				return "", Failure(502, "OAUTH_REGISTRATION_FAILED", "OAuth client registration failed")
-			}
-			defer resp.Body.Close()
-			var registered struct {
-				ClientID     string `json:"client_id"`
-				ClientSecret string `json:"client_secret"`
-			}
-			if resp.StatusCode != 200 && resp.StatusCode != 201 || common.DecodeJson(io.LimitReader(resp.Body, 128<<10), &registered) != nil || registered.ClientID == "" || len(registered.ClientID) > 256 || len(registered.ClientSecret) > 4096 || method != "none" && registered.ClientSecret == "" {
-				return "", Failure(502, "OAUTH_REGISTRATION_FAILED", "OAuth client registration failed")
-			}
-			server.Connection.ClientID = registered.ClientID
-			if server.Connection.Scopes == "" {
-				server.Connection.Scopes = strings.Join(flow.Metadata.Scopes, " ")
-			}
-			updates := map[string]any{"connection": server.Connection}
-			if registered.ClientSecret != "" {
-				sealed, err := Seal(registered.ClientSecret, "oauth-client:"+server.ID)
-				if err != nil {
-					return "", err
-				}
-				server.CredentialCiphertext = sealed
-				updates["credential_ciphertext"] = sealed
-			}
-			if err := model.UpdateMCPServer(server.ID, server.Revision, updates); err != nil {
-				return "", err
-			}
-			server.AuthMode = "oauth2"
+		server, err = registeredOAuthClient(ctx, server, flow.Metadata)
+		if err != nil {
+			return "", err
 		}
+		flow.AppID = server.Connection.ClientID
 		cfg, err = oauthClient(server, flow.Metadata)
 		if err != nil {
 			return "", err
@@ -409,6 +390,9 @@ func FinishAuthorization(ctx context.Context, userID int, sessionID, state, code
 		}
 	} else {
 		cfg, err = oauthClient(server, flow.Metadata)
+		if err == nil && flow.AppID != "" && cfg.ClientID != flow.AppID {
+			return row.Admin, fail
+		}
 		opts = append(opts, oauth2.SetAuthURLParam("resource", flow.Resource))
 	}
 	if err != nil {

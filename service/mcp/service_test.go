@@ -52,10 +52,15 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 		case "/api/login/oauth/introspect":
 			id, secret, ok := r.BasicAuth()
 			assert.True(t, ok)
-			assert.Equal(t, "resource-verifier", id)
-			assert.Equal(t, "verifier-secret", secret)
 			assert.NoError(t, r.ParseForm())
-			assert.Equal(t, resource, r.Form.Get("resource"))
+			if id == "business" || id == "other-business" {
+				assert.Equal(t, "casdoor-secret", secret)
+				assert.Empty(t, r.Form.Get("resource"))
+			} else {
+				assert.Contains(t, []string{"resource-verifier", "connector-client"}, id)
+				assert.Equal(t, "verifier-secret", secret)
+				assert.Equal(t, resource, r.Form.Get("resource"))
+			}
 			claims := jwt.MapClaims{}
 			_, err := jwt.ParseWithClaims(r.Form.Get("token"), claims, func(*jwt.Token) (any, error) { return &key.PublicKey, nil }, jwt.WithValidMethods([]string{"RS256"}))
 			if err != nil {
@@ -150,30 +155,66 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 		ctx := t.Context()
 		var public atomic.Bool
 		public.Store(true)
-		var chats, streams atomic.Int32
+		var chats, streams, exchanges atomic.Int32
+		var exchangeFailure, rejectBusiness atomic.Bool
+		var exchangeGate atomic.Pointer[chan struct{}]
+		exchangeStarted := make(chan struct{}, 2)
+		var expectedSecret atomic.Value
+		expectedSecret.Store("engine-exchange")
 		var appToken string
 		engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/v1/auth/app-exchange":
 				id, secret, ok := r.BasicAuth()
 				assert.True(t, ok)
-				assert.Equal(t, "business", id)
-				assert.Equal(t, "engine-exchange", secret)
+				assert.Contains(t, []string{"business", "other-business"}, id)
+				assert.Equal(t, expectedSecret.Load(), secret)
+				n := exchanges.Add(1)
+				if gate := exchangeGate.Load(); gate != nil {
+					exchangeStarted <- struct{}{}
+					select {
+					case <-*gate:
+					case <-r.Context().Done():
+						return
+					}
+				}
+				if exchangeFailure.Load() {
+					http.Error(w, "unavailable", 503)
+					return
+				}
 				var body map[string]string
 				assert.NoError(t, common.DecodeJson(r.Body, &body))
-				assert.Equal(t, map[string]string{"access_token": appToken}, body)
-				fmt.Fprint(w, `{"token_type":"bearer","access_token":"engine-user","expires_in":3540}`)
+				grantClaims := jwt.MapClaims{}
+				_, err := jwt.ParseWithClaims(body["access_token"], grantClaims, func(*jwt.Token) (any, error) { return &key.PublicKey, nil }, jwt.WithValidMethods([]string{"RS256"}), jwt.WithIssuer(issuer), jwt.WithAudience(id))
+				assert.NoError(t, err, "exchange uses the user's grant for this engine application")
+				assert.Contains(t, []any{"stable-alice", "stable-bob"}, grantClaims["sub"])
+				assert.Contains(t, strings.Fields(fmt.Sprint(grantClaims["scope"])), "system.login")
+				fmt.Fprintf(w, `{"token_type":"bearer","access_token":"engine-user-%d","expires_in":3540}`, n)
 			case "/v1/knowledge/kb/manual":
 				assert.Equal(t, "library-owner", r.URL.Query().Get("owner"))
-				assert.Equal(t, "Bearer engine-user", r.Header.Get("Authorization"))
+				assert.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Bearer engine-user-"))
+				if rejectBusiness.Load() {
+					http.Error(w, "invalid session", 401)
+					return
+				}
 				fmt.Fprintf(w, `{"id":"manual","owner":"library-owner","public_read":%t}`, public.Load())
 			case "/v1/knowledge/kb/manual/chat":
+				assert.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Bearer engine-user-"))
+				if rejectBusiness.Load() {
+					http.Error(w, "invalid session", 401)
+					return
+				}
 				assert.Equal(t, "POST", r.Method)
 				assert.Equal(t, "library-owner", r.URL.Query().Get("owner"))
 				assert.NotEmpty(t, r.Header.Get("Idempotency-Key"))
 				chats.Add(1)
 				fmt.Fprint(w, `{"task_id":"task-one","session_id":"session-one"}`)
 			case "/v1/tasks/task-one/stream":
+				assert.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Bearer engine-user-"))
+				if rejectBusiness.Load() {
+					http.Error(w, "invalid session", 401)
+					return
+				}
 				streams.Add(1)
 				w.Header().Set("Content-Type", "text/event-stream")
 				fmt.Fprint(w, `data: {"type":"connected","task_id":"task-one","status":"running"}
@@ -281,12 +322,204 @@ data: {"type":"completed"}
 		assert.Contains(t, fmt.Sprint(result.StructuredContent), "answer")
 		assert.NotContains(t, fmt.Sprint(result.StructuredContent), "private")
 		require.EqualValues(t, 1, streams.Load())
+		assert.EqualValues(t, 1, exchanges.Load(), "discovery, execution, replay and result checks reuse the engine JWT")
 		public.Store(false)
 		_, err = AuthorizedInvocationResult(ctx, call.Invocation, actor, false)
 		require.Error(t, err)
 		assert.EqualValues(t, 1, streams.Load())
+		public.Store(true)
+		cached, err := publicLibraryClient(ctx, server, actor)
+		require.NoError(t, err)
+		// Seed the time boundaries of an already-issued credential instead of sleeping.
+		scheduleRefresh := func(client *publicEngine, expires time.Time) {
+			knowledgeEngineTokens.mu.Lock()
+			entry := knowledgeEngineTokens.entries[client.engineTokenCacheKey]
+			entry.expires, entry.refreshAt = expires, time.Now().Add(-time.Second)
+			knowledgeEngineTokens.entries[client.engineTokenCacheKey] = entry
+			knowledgeEngineTokens.mu.Unlock()
+		}
+		for _, lifetime := range []time.Duration{10 * time.Second, -time.Second} {
+			before := exchanges.Load()
+			scheduleRefresh(cached, time.Now().Add(lifetime))
+			fresh, err := publicLibraryClient(ctx, server, actor)
+			require.NoError(t, err)
+			assert.Equal(t, before+1, exchanges.Load(), "near-expiry and expired entries are exchanged again")
+			assert.NotEqual(t, cached.token, fresh.token)
+			// A delayed 401 from the old credential must not evict its replacement.
+			rejectBusiness.Store(true)
+			err = cached.request(ctx, http.MethodGet, libraryPath(server, ""), nil, "", &map[string]any{})
+			require.Error(t, err)
+			rejectBusiness.Store(false)
+			current, err := publicLibraryClient(ctx, server, actor)
+			require.NoError(t, err)
+			assert.Equal(t, fresh.token, current.token)
+			assert.Equal(t, before+1, exchanges.Load())
+			cached = fresh
+		}
+		scheduleRefresh(cached, time.Now().Add(10*time.Second))
+		exchangeFailure.Store(true)
+		before := exchanges.Load()
+		_, err = publicLibraryClient(ctx, server, actor)
+		require.Error(t, err)
+		assert.Equal(t, "ENGINE_UNAVAILABLE", ErrorResponse(err).Code)
+		assert.Equal(t, before+1, exchanges.Load())
+		exchangeFailure.Store(false)
+		cached, err = publicLibraryClient(ctx, server, actor)
+		require.NoError(t, err)
+		assert.Equal(t, before+2, exchanges.Load(), "failed exchanges are never cached")
+
+		// An engine-side session rejection invalidates only the rejected credential.
+		for _, operation := range []string{"library", "create", "stream"} {
+			before := exchanges.Load()
+			rejectBusiness.Store(true)
+			switch operation {
+			case "library":
+				_, err = publicLibraryClient(ctx, server, actor)
+			case "create":
+				err = cached.request(ctx, http.MethodPost, libraryPath(server, "/chat"), map[string]any{"question": "How?"}, "rejected", &map[string]any{})
+			case "stream":
+				_, err = cached.snapshot(ctx, "task-one", nil)
+			}
+			require.Error(t, err)
+			assert.Equal(t, 401, ErrorResponse(err).Status)
+			assert.Equal(t, before, exchanges.Load(), "business requests are not automatically replayed")
+			rejectBusiness.Store(false)
+			cached, err = publicLibraryClient(ctx, server, actor)
+			require.NoError(t, err)
+			assert.Equal(t, before+1, exchanges.Load(), "the next request replaces the rejected engine JWT")
+		}
+		assert.EqualValues(t, 1, chats.Load(), "a rejected create request is not retried")
+		assert.EqualValues(t, 1, streams.Load())
+
+		for _, patch := range []map[string]any{
+			{"active": false}, {"iss": "other"}, {"sub": "other"}, {"client_id": "other"},
+			{"aud": "other"}, {"exp": time.Now().Add(-time.Hour).Unix()},
+		} {
+			before := exchanges.Load()
+			introspectionPatch = patch
+			_, err = publicLibraryClient(ctx, server, actor)
+			require.Error(t, err)
+			assert.Equal(t, "ENGINE_AUTHORIZATION_REQUIRED", ErrorResponse(err).Code)
+			assert.Equal(t, before, exchanges.Load(), "cached JWTs never bypass live source-grant checks")
+			introspectionPatch = map[string]any{}
+			cached, err = publicLibraryClient(ctx, server, actor)
+			require.NoError(t, err)
+			assert.Equal(t, before+1, exchanges.Load())
+		}
+
+		// Two callers share one refresh; cancelling the first does not cancel the
+		// shared exchange or leave the second caller without a usable credential.
+		scheduleRefresh(cached, time.Now().Add(10*time.Second))
+		gate := make(chan struct{})
+		exchangeGate.Store(&gate)
+		defer func() {
+			select {
+			case <-gate:
+			default:
+				close(gate)
+			}
+		}()
+		firstContext, cancelFirst := context.WithCancel(ctx)
+		firstResult := make(chan error, 1)
+		go func() { _, err := publicLibraryClient(firstContext, server, actor); firstResult <- err }()
+		select {
+		case <-exchangeStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("exchange did not start")
+		}
+		before = exchanges.Load()
+		cancelFirst()
+		select {
+		case err := <-firstResult:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(5 * time.Second):
+			t.Fatal("cancelled caller did not return")
+		}
+		secondResult := make(chan error, 1)
+		go func() { _, err := publicLibraryClient(ctx, server, actor); secondResult <- err }()
+		close(gate)
+		select {
+		case err := <-secondResult:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("second caller did not return")
+		}
+		exchangeGate.Store(nil)
+		assert.Equal(t, before, exchanges.Load(), "one exchange serves the concurrent callers")
+		cached, err = publicLibraryClient(ctx, server, actor)
+		require.NoError(t, err)
+
+		// A user's saved grant and a different engine application's grant have
+		// independent cache entries, even when they access the same public library.
+		require.NoError(t, model.DB.Create(&model.User{Id: 101, Username: "engine-cache-bob", AffCode: "engine-cache-bob", Group: "default", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}).Error)
+		require.NoError(t, model.DB.Create(&model.UserOAuthBinding{UserId: 101, ProviderId: 1, ProviderUserId: "stable-bob"}).Error)
+		bobClaims := maps.Clone(appClaims)
+		bobClaims["sub"] = "stable-bob"
+		require.NoError(t, storeEngineGrant(ctx, 101, oauth2.Token{AccessToken: sign(bobClaims), Expiry: time.Now().Add(time.Hour)}))
+		before = exchanges.Load()
+		bobClient, err := publicLibraryClient(ctx, server, &Actor{UserID: 101, CanCall: true})
+		require.NoError(t, err)
+		assert.Equal(t, before+1, exchanges.Load())
+		assert.NotEqual(t, cached.token, bobClient.token)
+		aliceClient, err := publicLibraryClient(ctx, server, actor)
+		require.NoError(t, err)
+		assert.Equal(t, cached.token, aliceClient.token)
+		assert.Equal(t, before+1, exchanges.Load())
+
+		t.Setenv("MCP_KNOWLEDGE_CLIENT_ID", "other-business")
+		otherClaims := maps.Clone(appClaims)
+		otherClaims["aud"], otherClaims["azp"] = "other-business", "other-business"
+		require.NoError(t, storeEngineGrant(ctx, 100, oauth2.Token{AccessToken: sign(otherClaims), Expiry: time.Now().Add(time.Hour)}))
+		otherClient, err := publicLibraryClient(ctx, server, actor)
+		require.NoError(t, err)
+		assert.NotEqual(t, cached.token, otherClient.token)
+		t.Setenv("MCP_KNOWLEDGE_CLIENT_ID", "business")
+		cached, err = publicLibraryClient(ctx, server, actor)
+		require.NoError(t, err)
+		assert.Equal(t, aliceClient.token, cached.token)
+
+		before = exchanges.Load()
+		t.Setenv("MCP_KNOWLEDGE_CLIENT_SECRET", "rotated-exchange")
+		expectedSecret.Store("rotated-exchange")
+		rotated, err := publicLibraryClient(ctx, server, actor)
+		require.NoError(t, err)
+		assert.Equal(t, before+1, exchanges.Load())
+		assert.NotEqual(t, cached.token, rotated.token)
+		t.Setenv("MCP_KNOWLEDGE_CLIENT_SECRET", "engine-exchange")
+		expectedSecret.Store("engine-exchange")
+		renewedClaims := maps.Clone(appClaims)
+		renewedClaims["grant_revision"] = "renewed"
+		renewedToken := sign(renewedClaims)
+		require.NoError(t, storeEngineGrant(ctx, 100, oauth2.Token{AccessToken: renewedToken, Expiry: time.Now().Add(time.Hour)}))
+		before = exchanges.Load()
+		cached, err = publicLibraryClient(ctx, server, actor)
+		require.NoError(t, err)
+		assert.Equal(t, before+1, exchanges.Load(), "replaced Casdoor grants do not reuse earlier JWTs")
+		shortExpiry := time.Now().Add(45 * time.Second).Truncate(time.Second)
+		require.NoError(t, storeEngineGrant(ctx, 100, oauth2.Token{AccessToken: renewedToken, Expiry: shortExpiry}))
+		shortClient, err := publicLibraryClient(ctx, server, actor)
+		require.NoError(t, err)
+		assert.True(t, shortClient.expires.Equal(shortExpiry), "engine credentials never outlive the source grant")
+		before = exchanges.Load()
+		require.NoError(t, model.DB.Where("id = ?", engineGrantID(100)).Delete(&model.MCPEngineGrant{}).Error)
+		_, err = publicLibraryClient(ctx, server, actor)
+		require.Error(t, err)
+		assert.Equal(t, before, exchanges.Load(), "removed local grants cannot use cached credentials")
+		require.NoError(t, storeEngineGrant(ctx, 100, oauth2.Token{AccessToken: renewedToken, Expiry: time.Now().Add(time.Hour)}))
+		// Missing introspection credentials preserve public-client compatibility
+		// through fresh exchanges, rather than serving an unchecked cached JWT.
+		t.Setenv("MCP_KNOWLEDGE_OAUTH_CLIENT_SECRET", "")
+		before = exchanges.Load()
+		for range 2 {
+			_, err = publicLibraryClient(ctx, server, actor)
+			require.NoError(t, err)
+		}
+		assert.Equal(t, before+2, exchanges.Load())
 	})
 	t.Run("local provider shares pricing and idempotency with catalog", func(t *testing.T) {
+		t.Setenv("MCP_OAUTH_CLIENT_ID", "")
+		t.Setenv("MCP_OAUTH_CLIENT_SECRET", "")
+		t.Setenv("MCP_OAUTH_ALLOWED_CLIENT_IDS", "")
 		ctx := context.Background()
 		resource = "https://gateway.test/mcp/providers/deepseek"
 		claims := maps.Clone(base)
@@ -308,7 +541,7 @@ data: {"type":"completed"}
 		t.Setenv("MCP_DEEPSEEK_BASE_URL", fixture.URL)
 		require.NoError(t, model.DB.Create(&model.Channel{Id: 1234, Name: "local-provider", Type: constant.ChannelTypeDeepSeek, Status: common.ChannelStatusEnabled, Key: "supplier-key", BaseURL: &fixture.URL}).Error)
 		require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 100).Update("quota", 2000).Error)
-		input := ServerInput{Icon: "OpenAI", Readme: "Fixture README", Name: "Search", AuthMode: "oauth2", Connection: model.MCPConnection{URL: resource, Transport: "streamable_http", ClientID: "connector-client"}}
+		input := ServerInput{Icon: "OpenAI", Readme: "Fixture README", Name: "Search", ClientSecret: "verifier-secret", AuthMode: "oauth2", Connection: model.MCPConnection{URL: resource, Transport: "streamable_http", ClientID: "connector-client"}}
 		server, err := CreateServer(input)
 		require.NoError(t, err)
 		_, err = CreateServer(input)
@@ -860,17 +1093,25 @@ func TestMCPCredentialsAreBoundToRecord(t *testing.T) {
 }
 
 func TestMCPLocalDeploymentOAuthClient(t *testing.T) {
+	t.Setenv("MCP_ENCRYPTION_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	t.Setenv("MCP_PUBLIC_BASE_URL", "https://gateway.test")
 	t.Setenv("MCP_CASDOOR_ISSUER", "https://issuer.test")
-	t.Setenv("MCP_OAUTH_CLIENT_ID", "local-client")
-	t.Setenv("MCP_OAUTH_CLIENT_SECRET", "fixture-secret")
-	server := &model.MCPServer{Kind: "deepseek", Catalog: true, Connection: model.MCPConnection{URL: "https://gateway.test/mcp/providers/deepseek", ClientID: "local-client"}}
-	cfg, err := oauthClient(server, oauthDiscovery{Issuer: "https://issuer.test"})
+	t.Setenv("MCP_OAUTH_CLIENT_ID", "")
+	t.Setenv("MCP_OAUTH_CLIENT_SECRET", "")
+	sealed, err := Seal("fixture-secret", "oauth-client:local-server")
+	require.NoError(t, err)
+	server := &model.MCPServer{ID: "local-server", CredentialCiphertext: sealed, Kind: "deepseek", Catalog: true, Connection: model.MCPConnection{URL: "https://gateway.test/mcp/providers/deepseek", ClientID: "local-client"}}
+	server.Name, server.Connection.Transport = "DeepSeek", "streamable_http"
+	require.NoError(t, NormalizeServer(server))
+	assert.Empty(t, server.Connection.Scopes, "local providers also default to scope discovery")
+	cfg, err := oauthClient(server, oauthDiscovery{Issuer: "https://issuer.test", Scopes: []string{"mcp:tools:read", "mcp:tools:call"}})
 	require.NoError(t, err)
 	assert.Equal(t, "fixture-secret", cfg.ClientSecret)
+	assert.Equal(t, []string{"mcp:tools:read", "mcp:tools:call"}, cfg.Scopes)
 	_, err = oauthClient(server, oauthDiscovery{Issuer: "https://other.test"})
 	require.Error(t, err)
 	server.Kind = "remote_mcp"
+	server.CredentialCiphertext = ""
 	cfg, err = oauthClient(server, oauthDiscovery{Issuer: "https://other.test"})
 	require.NoError(t, err)
 	assert.Empty(t, cfg.ClientSecret)
@@ -1065,7 +1306,7 @@ func TestMCPCatalogTransportsAndOAuthInstallation(t *testing.T) {
 			var exchanges atomic.Int32
 			if transport == "oauth2" || transport == "oauth_sse" {
 				mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", func(w http.ResponseWriter, _ *http.Request) {
-					fmt.Fprintf(w, `{"resource":%q,"authorization_servers":[%q]}`, endpoint, fixture.URL)
+					fmt.Fprintf(w, `{"resource":%q,"authorization_servers":[%q],"scopes_supported":["tools:read","tools:call"]}`, endpoint, fixture.URL)
 				})
 				mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, _ *http.Request) {
 					fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true}`, fixture.URL, fixture.URL+"/authorize", fixture.URL+"/token")
@@ -1117,6 +1358,7 @@ func TestMCPCatalogTransportsAndOAuthInstallation(t *testing.T) {
 				state := parsed.Query().Get("state")
 				assert.Equal(t, "S256", parsed.Query().Get("code_challenge_method"))
 				assert.Equal(t, endpoint, parsed.Query().Get("resource"))
+				assert.Equal(t, "tools:read tools:call", parsed.Query().Get("scope"))
 				_, err = FinishAuthorization(ctx, 82, browserSession, state, "code", fixture.URL)
 				require.Error(t, err)
 				_, err = FinishAuthorization(ctx, 81, "different-session", state, "code", fixture.URL)
@@ -1127,6 +1369,20 @@ func TestMCPCatalogTransportsAndOAuthInstallation(t *testing.T) {
 				_, err = FinishAuthorization(ctx, 81, browserSession, state, "code", fixture.URL)
 				require.Error(t, err)
 				assert.EqualValues(t, 1, exchanges.Load())
+				// An in-flight code is bound to the client that started the flow.
+				require.NoError(t, model.DB.First(row, "id = ?", row.ID).Error)
+				target, err = BeginAuthorization(ctx, row, browserSession)
+				require.NoError(t, err)
+				changedURL, err := url.Parse(target)
+				require.NoError(t, err)
+				originalConnection := server.Connection
+				changed := originalConnection
+				changed.ClientID = "replacement-client"
+				require.NoError(t, model.DB.Model(server).Update("connection", changed).Error)
+				_, err = FinishAuthorization(ctx, 81, browserSession, changedURL.Query().Get("state"), "code", fixture.URL)
+				require.Error(t, err)
+				assert.EqualValues(t, 1, exchanges.Load(), "a changed client must be rejected before code exchange")
+				require.NoError(t, model.DB.Model(server).Update("connection", originalConnection).Error)
 			}
 			tested, err := TestConnection(ctx, server.ID, 81, browserSession)
 			require.NoError(t, err)
@@ -1337,4 +1593,181 @@ func TestMCPSharedGrantUpgradeAndRevocation(t *testing.T) {
 	_, err = ReusableInstallationToken(t.Context(), server, 91)
 	require.Error(t, err)
 	require.ErrorIs(t, saveGrant(shared, server.ConnectionRevision, grant), model.ErrMCPRevisionConflict, "a stale refresh must not restore a revoked token")
+}
+
+func TestMCPOAuthScopeDiscovery(t *testing.T) {
+	setupMCPService(t)
+	for _, tc := range []struct {
+		name, challenge, override, want string
+		resourceScopes                  []string
+		dynamic, forbidden, invalid     bool
+	}{
+		{name: "challenge takes precedence", challenge: `Basic realm="scope=unrelated", Bearer scope="tools:read tools:call"`, resourceScopes: []string{"resource:read"}, want: "tools:read tools:call"},
+		{name: "resource metadata fallback", resourceScopes: []string{"tools:read", "tools:call"}, want: "tools:read tools:call"},
+		{name: "authorization server scopes are not requested"},
+		{name: "manual override", challenge: `Bearer scope="tools:read"`, override: "custom:read custom:call", want: "custom:read custom:call"},
+		{name: "dynamic registration", resourceScopes: []string{"tools:read"}, dynamic: true, want: "tools:read"},
+		{name: "dynamic registration with manual override", challenge: `Bearer scope="tools:read"`, dynamic: true, override: "custom:read", want: "custom:read"},
+		{name: "insufficient scope challenge", challenge: `Bearer error="insufficient_scope", scope="tools:call"`, forbidden: true, want: "tools:call"},
+		{name: "malformed challenge", challenge: `Bearer scope="unterminated`, invalid: true},
+		{name: "oversized scopes", resourceScopes: []string{strings.Repeat("x", 2049)}, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			fixture := httptest.NewServer(mux)
+			defer fixture.Close()
+			t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", fixture.URL)
+			endpoint := fixture.URL + "/mcp"
+			mux.HandleFunc("/mcp", func(w http.ResponseWriter, _ *http.Request) {
+				if tc.challenge != "" {
+					w.Header().Add("WWW-Authenticate", tc.challenge)
+				}
+				if tc.forbidden {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+			})
+			scopes, err := common.Marshal(tc.resourceScopes)
+			require.NoError(t, err)
+			mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprintf(w, `{"resource":%q,"authorization_servers":[%q],"scopes_supported":%s}`, endpoint, fixture.URL, scopes)
+			})
+			mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"registration_endpoint":%q,"token_endpoint_auth_methods_supported":["none"],"code_challenge_methods_supported":["S256"],"scopes_supported":["unrelated:admin"]}`, fixture.URL, fixture.URL+"/authorize", fixture.URL+"/token", fixture.URL+"/register")
+			})
+			mux.HandleFunc("/register", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"client_id":"dynamic-client"}`)
+			})
+			connection := model.MCPConnection{URL: endpoint, Transport: "streamable_http", ClientID: "registered", Scopes: tc.override}
+			if tc.dynamic {
+				connection.ClientID = ""
+			}
+			server, err := CreateServer(ServerInput{Name: tc.name, Connection: connection})
+			require.NoError(t, err)
+			row, err := Install(server.ID, 81, true)
+			require.NoError(t, err)
+			target, err := BeginAuthorization(t.Context(), row, "scope-session")
+			if tc.invalid {
+				require.Error(t, err)
+				assert.Equal(t, "OAUTH_DISCOVERY_FAILED", ErrorResponse(err).Code)
+				assert.Empty(t, target)
+				return
+			}
+			require.NoError(t, err)
+			parsed, err := url.Parse(target)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, parsed.Query().Get("scope"))
+			assert.Equal(t, tc.want != "", parsed.Query().Has("scope"))
+			assert.Equal(t, endpoint, parsed.Query().Get("resource"))
+			assert.Equal(t, "S256", parsed.Query().Get("code_challenge_method"))
+			saved, err := model.GetMCPServer(server.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.override, saved.Connection.Scopes, "discovered scopes must not become permanent overrides")
+			var pending model.MCPAuthorizationFlow
+			require.NoError(t, model.DB.First(&pending, "id = ?", Digest(parsed.Query().Get("state"))).Error)
+			raw, err := Open(string(pending.Ciphertext), "oauth-flow:"+pending.ID)
+			require.NoError(t, err)
+			var flow oauthFlow
+			require.NoError(t, common.UnmarshalJsonStr(raw, &flow))
+			if tc.override == "" {
+				assert.Equal(t, tc.want, strings.Join(flow.Metadata.Scopes, " "), "discovery is persisted with the authorization flow")
+			}
+		})
+	}
+}
+
+func TestMCPLocalDynamicClientRegistration(t *testing.T) {
+	setupMCPService(t)
+	t.Setenv("MCP_OAUTH_CLIENT_ID", "")
+	t.Setenv("MCP_OAUTH_CLIENT_SECRET", "")
+	t.Setenv("MCP_CASDOOR_ORGANIZATION", "mcp-local")
+	var registrations atomic.Int32
+	var reject atomic.Bool
+	reject.Store(true)
+	mux := http.NewServeMux()
+	fixture := httptest.NewServer(mux)
+	defer fixture.Close()
+	t.Setenv("MCP_PUBLIC_BASE_URL", fixture.URL)
+	t.Setenv("MCP_CASDOOR_ISSUER", fixture.URL)
+	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", fixture.URL)
+	endpoint := fixture.URL + "/mcp/providers/deepseek"
+	meta := oauthDiscovery{Issuer: fixture.URL, AuthURL: fixture.URL + "/authorize", TokenURL: fixture.URL + "/token", RegistrationURL: fixture.URL + "/register", Challenges: []string{"S256"}, Scopes: []string{"mcp:tools:read", "mcp:tools:call"}}
+	mux.HandleFunc("/mcp/providers/deepseek", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) })
+	mux.HandleFunc("/.well-known/oauth-protected-resource/mcp/providers/deepseek", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"resource":%q,"authorization_servers":[%q],"scopes_supported":["mcp:tools:read","mcp:tools:call"]}`, endpoint, fixture.URL)
+	})
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		data, err := common.Marshal(meta)
+		assert.NoError(t, err)
+		_, _ = w.Write(data)
+	})
+	mux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+		registrations.Add(1)
+		assert.Equal(t, "mcp-local", r.URL.Query().Get("organization"))
+		var body map[string]any
+		assert.NoError(t, common.DecodeJson(r.Body, &body))
+		assert.Equal(t, "client_secret_basic", body["token_endpoint_auth_method"])
+		assert.Equal(t, "mcp:tools:read mcp:tools:call", body["scope"])
+		assert.Equal(t, []any{fixture.URL + "/api/mcp/oauth/callback"}, body["redirect_uris"])
+		w.Header().Set("Content-Type", "application/json")
+		if reject.Load() {
+			fmt.Fprint(w, `{"client_id":"incomplete-client"}`)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, `{"client_id":"registered-local","client_secret":"registered-secret","token_endpoint_auth_method":"client_secret_basic"}`)
+	})
+	server, err := CreateServer(ServerInput{Name: "Local automatic client", Connection: model.MCPConnection{URL: endpoint, Transport: "streamable_http"}})
+	require.NoError(t, err)
+	assert.Empty(t, server.Connection.ClientID)
+	assert.Equal(t, "oauth2", server.AuthMode, "an unregistered local service must never become unauthenticated")
+	for _, invalid := range []oauthDiscovery{
+		{Issuer: "https://untrusted.test", RegistrationURL: meta.RegistrationURL},
+		{Issuer: meta.Issuer, RegistrationURL: "https://untrusted.test/register"},
+		{Issuer: meta.Issuer},
+		{Issuer: meta.Issuer, RegistrationURL: meta.RegistrationURL, Methods: []string{"none"}},
+	} {
+		_, err := registeredOAuthClient(t.Context(), server, invalid)
+		require.Error(t, err)
+	}
+	assert.Zero(t, registrations.Load())
+	_, err = registeredOAuthClient(t.Context(), server, meta)
+	require.Error(t, err)
+	saved, err := model.GetMCPServer(server.ID)
+	require.NoError(t, err)
+	assert.Empty(t, saved.Connection.ClientID, "failed registration must not persist a partial client")
+	reject.Store(false)
+	var wg sync.WaitGroup
+	results := make(chan error, 2)
+	for range 2 {
+		wg.Go(func() {
+			_, err := registeredOAuthClient(t.Context(), server, meta)
+			results <- err
+		})
+	}
+	wg.Wait()
+	close(results)
+	for err := range results {
+		require.NoError(t, err)
+	}
+	assert.EqualValues(t, 2, registrations.Load(), "one failed attempt and one successful shared registration")
+	saved, err = model.GetMCPServer(server.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "registered-local", saved.Connection.ClientID)
+	assert.NotContains(t, saved.CredentialCiphertext, "registered-secret")
+	secret, err := Open(saved.CredentialCiphertext, "oauth-client:"+saved.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "registered-secret", secret)
+	row, err := Install(server.ID, 81, true)
+	require.NoError(t, err)
+	target, err := BeginAuthorization(t.Context(), row, "browser-session")
+	require.NoError(t, err)
+	parsed, err := url.Parse(target)
+	require.NoError(t, err)
+	assert.Equal(t, "registered-local", parsed.Query().Get("client_id"))
+	assert.Equal(t, "S256", parsed.Query().Get("code_challenge_method"))
+	assert.Equal(t, endpoint, parsed.Query().Get("resource"))
+	assert.EqualValues(t, 2, registrations.Load(), "later authorizations reuse persisted registration")
 }

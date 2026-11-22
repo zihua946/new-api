@@ -18,9 +18,10 @@ import (
 )
 
 type knowledgeClient struct {
-	client *http.Client
-	server *model.MCPServer
-	token  string
+	client              *http.Client
+	server              *model.MCPServer
+	token               string
+	engineTokenCacheKey string
 }
 
 func (engine *knowledgeClient) request(ctx context.Context, method, path string, payload any, key string, target any) error {
@@ -47,6 +48,10 @@ func (engine *knowledgeClient) request(ctx context.Context, method, path string,
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if response.StatusCode == http.StatusUnauthorized && engine.engineTokenCacheKey != "" {
+			knowledgeEngineTokens.invalidate(engine.engineTokenCacheKey, engine.token)
+			return Failure(401, "ENGINE_AUTHORIZATION_REQUIRED", "Knowledge engine authorization is no longer valid")
+		}
 		status, code := response.StatusCode, "ENGINE_REQUEST_FAILED"
 		switch status {
 		case 403, 404:

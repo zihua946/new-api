@@ -23,6 +23,10 @@ function DetailRoute() {
       onTabChange={(value) =>
         void navigate({ search: { tab: value, manage }, replace: true })
       }
+      onReturnToMarketplace={(error) => {
+        if (error) sessionStorage.setItem('mcp-authorization-error', error)
+        void navigate({ to: '/mcp-marketplace', replace: true })
+      }}
     />
   )
 }

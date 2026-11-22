@@ -1,9 +1,11 @@
 package model
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -18,6 +20,12 @@ var (
 	ErrMCPBillingState      = errors.New("MCP billing state does not allow this operation")
 	ErrMCPBillingPending    = errors.New("MCP funding operation requires reconciliation")
 )
+
+// Legacy batch deltas are process-local. Another process (including a restarted
+// owner) cannot tell whether a reservation flushed before a crash. Never issue
+// an automatic refund against an unconfirmed batch: it could create a credit
+// for a debit that was lost. This ownership guard is MCP-only.
+var mcpBatchState = "batch:" + rand.Text()[:16]
 
 func ReserveMCPCharge(invocationID string) error {
 	err := applyMCPCharge(invocationID, "reserve")
@@ -69,26 +77,32 @@ func SwitchMCPToPersonalPayer(invocationID string) error {
 	})
 }
 
+// MCP records ownership of each invocation's funding operation, but delegates
+// balances to the existing model billing APIs. An executing operation is never
+// replayed: those APIs may have changed Redis, queued a batch delta, or committed
+// SQL before losing their acknowledgement. Applied means the legacy API accepted
+// the mutation, not that an enabled in-memory batch has flushed. Such operations require reconciliation
+// against the original balances, not another non-idempotent debit or refund.
 func applyMCPCharge(invocationID, kind string) error {
-	var initial MCPInvocation
-	if err := DB.First(&initial, "id = ?", invocationID).Error; err != nil {
+	var call MCPInvocation
+	if err := DB.First(&call, "id = ?", invocationID).Error; err != nil {
 		return err
 	}
-	if initial.ChargeQuota == 0 {
+	if call.ChargeQuota == 0 {
 		return nil
 	}
-	if initial.ChargeQuota < 0 || initial.ChargeQuota > common.MaxQuota || initial.PayerUserID <= 0 {
+	if call.ChargeQuota < 0 || call.ChargeQuota > common.MaxQuota || call.PayerUserID <= 0 {
 		return ErrMCPBillingState
 	}
-	op := MCPBillingOperation{ID: mcpFundingOperationID(&initial, kind), InvocationID: invocationID, Kind: kind, Amount: initial.ChargeQuota, PayerUserID: initial.PayerUserID, TokenID: initial.TokenID, State: "pending"}
+	op := MCPBillingOperation{ID: mcpFundingOperationID(&call, kind), InvocationID: invocationID, Kind: kind, Amount: call.ChargeQuota, PayerUserID: call.PayerUserID, TokenID: call.TokenID, State: "pending"}
 	if err := DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&op).Error; err != nil {
 		return err
 	}
+	claimed := false
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&MCPInvocation{}).Where("id = ?", invocationID).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
 			return err
 		}
-		var call MCPInvocation
 		if err := lockForUpdate(tx).First(&call, "id = ?", invocationID).Error; err != nil {
 			return err
 		}
@@ -101,80 +115,113 @@ func applyMCPCharge(invocationID, kind string) error {
 		if op.State == "applied" {
 			return nil
 		}
-		if op.State != "pending" || op.Amount != call.ChargeQuota {
+		if strings.HasPrefix(op.State, "batch:") {
+			if op.State != mcpBatchState {
+				return ErrMCPBillingPending
+			}
+			return nil
+		}
+		if op.State == "executing" {
+			return ErrMCPBillingPending
+		}
+		if op.State != "pending" {
 			return ErrMCPBillingState
 		}
-		if kind == "reserve" && call.BillingStatus != "reserving" || kind != "reserve" && call.BillingStatus != "reserved" && call.BillingStatus != "reconciliation_pending" && call.BillingStatus != "refund_pending" {
+		allowed := false
+		switch kind {
+		case "reserve":
+			allowed = call.BillingStatus == "reserving"
+		case "refund":
+			allowed = call.BillingStatus == "reserved" || call.BillingStatus == "refund_pending" || call.BillingStatus == "reconciliation_pending"
+		case "settle":
+			allowed = call.BillingStatus == "reserved" || call.BillingStatus == "reconciliation_pending"
+		}
+		if !allowed {
 			return ErrMCPBillingState
 		}
-		user, err := lockQuotaUser(tx, call.PayerUserID, true)
-		if err != nil {
-			return err
-		}
-		if call.TokenID > 0 {
-			token, err := lockQuotaToken(tx, call.TokenID, true)
-			if err != nil {
+		if kind != "reserve" {
+			var reservation MCPBillingOperation
+			if err := tx.First(&reservation, "id = ?", mcpFundingOperationID(&call, "reserve")).Error; err != nil {
 				return err
 			}
-			if token.UserId != call.UserID {
-				return ErrMCPBillingState
+			if strings.HasPrefix(reservation.State, "batch:") {
+				if reservation.State != mcpBatchState {
+					return ErrMCPBillingPending
+				}
+			} else if reservation.State != "applied" {
+				return ErrMCPBillingPending
 			}
 		}
 		if kind == "settle" {
+			var user User
+			if err := lockForUpdate(tx.Unscoped()).First(&user, call.PayerUserID).Error; err != nil {
+				return err
+			}
 			if _, err := common.WalletQuotaFromDecimalStrict(decimal.NewFromInt(int64(user.UsedQuota)).Add(decimal.NewFromInt(int64(call.ChargeQuota)))); err != nil {
 				return err
 			}
 			if err := tx.Unscoped().Model(&User{}).Where("id = ?", user.Id).Update("used_quota", gorm.Expr("used_quota + ?", call.ChargeQuota)).Error; err != nil {
 				return err
 			}
-			if err := tx.Model(&MCPInvocation{}).Where("id = ?", call.ID).Updates(map[string]any{"billing_status": "settled", "charged_quota": call.ChargeQuota, "reconcile_at": nil}).Error; err != nil {
+			if err := tx.Model(&call).Updates(map[string]any{"billing_status": "settled", "charged_quota": call.ChargeQuota, "reconcile_at": nil}).Error; err != nil {
 				return err
 			}
 			return tx.Model(&op).Update("state", "applied").Error
 		}
-		delta := call.ChargeQuota
-		if kind == "reserve" {
-			delta = -delta
-		}
-		walletID := call.PayerUserID
-		if kind == "reserve" && call.FundingPreference != "" {
-			err = reserveMCPFunding(tx, &call, delta)
-		} else {
-			if call.FundingSource == "subscription" {
-				if err = refundSubscription(tx, mcpFundingOperationID(&call, "reserve")); err != nil {
-					return err
-				}
-				walletID = 0
-			}
-			err = mutateQuotaInTx(tx, walletID, call.TokenID, delta, kind == "reserve")
-		}
-		if err != nil {
-			switch {
-			case errors.Is(err, ErrQuotaWalletInsufficient), errors.Is(err, ErrNoActiveSubscription), errors.Is(err, ErrSubscriptionQuotaInsufficient):
-				return ErrMCPInsufficientQuota
-			case errors.Is(err, ErrQuotaTokenInsufficient):
-				return ErrMCPTokenQuota
-			case errors.Is(err, ErrQuotaCacheUnavailable):
-				return ErrMCPBillingPending
-			default:
+		if kind == "refund" {
+			if err := tx.Model(&call).Update("billing_status", "refund_pending").Error; err != nil {
 				return err
 			}
 		}
-		state := "reserved"
-		if kind == "refund" {
-			state = "refunded"
-		}
-		if err := tx.Model(&MCPInvocation{}).Where("id = ?", call.ID).Updates(map[string]any{"billing_status": state, "charged_quota": 0, "funding_source": call.FundingSource, "subscription_id": call.SubscriptionID}).Error; err != nil {
-			return err
-		}
-		return tx.Model(&op).Update("state", "applied").Error
+		claimed = true
+		return tx.Model(&op).Update("state", "executing").Error
 	})
+	if err != nil || !claimed {
+		return err
+	}
 
-	return err
+	state, billing := "applied", "reserved"
+	if kind == "reserve" {
+		err = reserveMCPFunding(&call)
+		if errors.Is(err, ErrMCPInsufficientQuota) || errors.Is(err, ErrMCPTokenQuota) {
+			state, billing = "aborted", "refunded"
+		}
+	} else {
+		billing = "refunded"
+		err = refundMCPFunding(&call)
+	}
+	if err != nil && state != "aborted" {
+		common.SysError(fmt.Sprintf("MCP funding requires manual reconciliation: invocation=%s operation=%s error=%v", call.ID, op.ID, err))
+		return ErrMCPBillingPending
+	}
+	fundingErr := err
+	if kind == "reserve" && state == "applied" && common.BatchUpdateEnabled {
+		state = mcpBatchState
+	}
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&MCPBillingOperation{}).Where("id = ? AND state = ?", op.ID, "executing").Update("state", state)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrMCPBillingState
+		}
+		return tx.Model(&call).Updates(map[string]any{"billing_status": billing, "charged_quota": 0, "funding_source": call.FundingSource, "subscription_id": call.SubscriptionID}).Error
+	})
+	if err != nil {
+		// A lost commit response can be resolved from the ledger. If SQL is
+		// unavailable or still says executing, never repeat the balance mutation.
+		var stored MCPBillingOperation
+		if readErr := DB.First(&stored, "id = ?", op.ID).Error; readErr != nil || stored.State != state {
+			common.SysError(fmt.Sprintf("MCP funding outcome not recorded: invocation=%s operation=%s error=%v", call.ID, op.ID, err))
+			return ErrMCPBillingPending
+		}
+	}
+	return fundingErr
 }
 
-// AbortMCPReservation cancels an uncommitted reservation. No cache monetary
-// compensation is needed: SQL balances and operation state commit atomically.
+// AbortMCPReservation cancels only work that never entered the legacy balance
+// APIs. An executing operation may already have changed balances and is not replayed.
 func AbortMCPReservation(invocationID string) error {
 	return DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&MCPInvocation{}).Where("id = ?", invocationID).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
@@ -194,6 +241,9 @@ func AbortMCPReservation(invocationID string) error {
 		if op.State == "aborted" {
 			return nil
 		}
+		if op.State == "executing" {
+			return ErrMCPBillingPending
+		}
 		if op.State != "pending" || call.BillingStatus != "reserving" {
 			return ErrMCPBillingState
 		}
@@ -205,7 +255,8 @@ func AbortMCPReservation(invocationID string) error {
 }
 
 // ReconcileMCPCharge never repeats an upstream request. Persisted outcomes are
-// settled; everything unresolved beyond the deadline is released to the user.
+// settled and confirmed reservations are refunded after the deadline. Ambiguous
+// legacy balance operations remain pending for manual reconciliation.
 func ReconcileMCPCharge(invocationID string, now time.Time) error {
 	var call MCPInvocation
 	if err := DB.First(&call, "id = ?", invocationID).Error; err != nil {
@@ -228,7 +279,7 @@ func ReconcileMCPCharge(invocationID string, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	if reserve.State != "applied" {
+	if reserve.State != "applied" && !strings.HasPrefix(reserve.State, "batch:") {
 		return AbortMCPReservation(invocationID)
 	}
 	if err = RefundMCPCharge(invocationID); err != nil {
@@ -267,52 +318,141 @@ func ClaimMCPInvocation(id string, limit int, timeout time.Duration) error {
 	})
 }
 
-// Wallet and subscription mutations share the invocation transaction with
-// the API-token mutation. A failed token check rolls back either funding source.
-func reserveMCPFunding(tx *gorm.DB, call *MCPInvocation, delta int) error {
-	wallet := func() error {
-		call.FundingSource = "wallet"
-		return mutateQuotaInTx(tx, call.PayerUserID, call.TokenID, delta, true)
+// reserveMCPFunding uses the same wallet/token reservation and subscription APIs
+// as model calls. It does not invalidate caches, flush other requests' batches,
+// or replace the model funding implementation.
+func reserveMCPFunding(call *MCPInvocation) error {
+	user, err := GetUserById(call.PayerUserID, false)
+	if err != nil || user.Status != common.UserStatusEnabled {
+		return ErrMCPBillingState
 	}
-	subscription := func() error {
-		record, err := preConsumeSubscription(tx, mcpFundingOperationID(call, "reserve"), call.PayerUserID, int64(call.ChargeQuota), common.GetTimestamp())
+	var token *Token
+	if call.TokenID > 0 {
+		token, err = GetTokenById(call.TokenID)
+		if err != nil || token.UserId != call.UserID || token.Status != common.TokenStatusEnabled || token.ExpiredTime != -1 && token.ExpiredTime <= common.GetTimestamp() {
+			return ErrMCPBillingState
+		}
+	}
+	wallet := func() error {
+		// Record the intended source before invoking non-idempotent balance APIs.
+		call.FundingSource = "wallet"
+		if err := DB.Model(call).Update("funding_source", call.FundingSource).Error; err != nil {
+			return err
+		}
+		reserved, err := TryReserveUserQuota(call.PayerUserID, call.ChargeQuota)
 		if err != nil {
 			return err
 		}
-		call.FundingSource, call.SubscriptionID = "subscription", record.UserSubscriptionId
-		if call.TokenID == 0 {
-			return nil
+		if !reserved {
+			return ErrMCPInsufficientQuota
 		}
-		return mutateQuotaInTx(tx, 0, call.TokenID, delta, true)
+		return nil
+	}
+	subscription := func() error {
+		call.FundingSource = "subscription"
+		if err := DB.Model(call).Update("funding_source", call.FundingSource).Error; err != nil {
+			return err
+		}
+		record, err := PreConsumeUserSubscription(mcpFundingOperationID(call, "reserve"), call.PayerUserID, "", 0, int64(call.ChargeQuota))
+		if err != nil {
+			return err
+		}
+		call.SubscriptionID = record.UserSubscriptionId
+		return nil
 	}
 	switch call.FundingPreference {
+	case "", "wallet_only":
+		err = wallet()
 	case "subscription_only":
-		return subscription()
-	case "wallet_only":
-		return wallet()
+		err = subscription()
 	case "wallet_first":
-		err := wallet()
-		if errors.Is(err, ErrQuotaWalletInsufficient) {
-			return subscription()
+		err = wallet()
+		if errors.Is(err, ErrMCPInsufficientQuota) {
+			err = subscription()
 		}
-		return err
 	default:
-		err := subscription()
+		err = subscription()
 		if errors.Is(err, ErrNoActiveSubscription) {
-			return wallet()
+			err = wallet()
+		} else if errors.Is(err, ErrSubscriptionQuotaInsufficient) {
+			var strict int64
+			if queryErr := DB.Model(&UserSubscription{}).Where("user_id = ? AND status = ? AND end_time > ? AND allow_wallet_overflow = ?", call.PayerUserID, "active", common.GetTimestamp(), false).Count(&strict).Error; queryErr != nil {
+				return queryErr
+			}
+			if strict == 0 {
+				err = wallet()
+			}
 		}
-		if !errors.Is(err, ErrSubscriptionQuotaInsufficient) {
-			return err
-		}
-		var strict int64
-		if err = tx.Model(&UserSubscription{}).Where("user_id = ? AND status = ? AND end_time > ? AND allow_wallet_overflow = ?", call.PayerUserID, "active", common.GetTimestamp(), false).Count(&strict).Error; err != nil {
-			return err
-		}
-		if strict != 0 {
-			return ErrSubscriptionQuotaInsufficient
-		}
-		return wallet()
 	}
+	if errors.Is(err, ErrNoActiveSubscription) || errors.Is(err, ErrSubscriptionQuotaInsufficient) {
+		return ErrMCPInsufficientQuota
+	}
+	if err != nil || token == nil {
+		return err
+	}
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, call.ChargeQuota, token.UnlimitedQuota)
+	if err != nil {
+		// A failed reply is not proof that the token debit did not happen.
+		return err
+	}
+	if reserved {
+		return nil
+	}
+	// A definite token balance rejection has no token delta to compensate.
+	if call.FundingSource == "subscription" {
+		err = refundMCPSubscription(mcpFundingOperationID(call, "reserve"))
+	} else {
+		err = IncreaseUserQuota(call.PayerUserID, call.ChargeQuota, false)
+	}
+	if err != nil {
+		return err
+	}
+	return ErrMCPTokenQuota
+}
+
+func refundMCPFunding(call *MCPInvocation) error {
+	var err error
+	if call.FundingSource == "subscription" {
+		err = refundMCPSubscription(mcpFundingOperationID(call, "reserve"))
+	} else {
+		err = IncreaseUserQuota(call.PayerUserID, call.ChargeQuota, false)
+	}
+	if err != nil || call.TokenID == 0 {
+		return err
+	}
+	var token Token
+	if err := DB.Unscoped().First(&token, call.TokenID).Error; err != nil {
+		return err
+	}
+	return IncreaseTokenQuota(token.Id, token.Key, call.ChargeQuota)
+}
+
+// Keep the MCP subscription refund and its idempotency receipt in one
+// transaction. The legacy public subscription API is deliberately unchanged;
+// its separate nested transaction cannot be used under SQLite WAL snapshots.
+func refundMCPSubscription(requestID string) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&SubscriptionPreConsumeRecord{}).Where("request_id = ?", requestID).UpdateColumn("request_id", gorm.Expr("request_id")).Error; err != nil {
+			return err
+		}
+		var record SubscriptionPreConsumeRecord
+		if err := lockForUpdate(tx).Where("request_id = ?", requestID).First(&record).Error; err != nil {
+			return err
+		}
+		if record.Status == "refunded" {
+			return nil
+		}
+		if record.PreConsumed > 0 {
+			var subscription UserSubscription
+			if err := lockForUpdate(tx).First(&subscription, record.UserSubscriptionId).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&subscription).Update("amount_used", max(subscription.AmountUsed-record.PreConsumed, 0)).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Model(&record).Update("status", "refunded").Error
+	})
 }
 
 // The invocation serializes receipt delivery, including recovery after the

@@ -72,7 +72,6 @@ const schema = z
     ]),
     client_id: z.string().trim().max(256),
     client_secret: z.string().max(4096),
-    scopes: z.string().max(2048),
     timeout: z.number().int().min(1).max(600),
     concurrency: z.number().int().min(1).max(1000),
   })
@@ -102,7 +101,6 @@ export function ServerForm(props: {
   const { server } = props
   const [headers, setHeaders] = useState<Record<string, string>>()
   const [env, setEnv] = useState<Record<string, string>>()
-  const [clearSecret, setClearSecret] = useState(false)
   const publicConfig = useQuery({
     queryKey: ['mcp', 'oauth-config'],
     queryFn: () => mcpRequest<{ callback_url: string }>('/oauth/config'),
@@ -131,7 +129,6 @@ export function ServerForm(props: {
           : remoteTransport,
       client_id: server?.connection.client_id ?? '',
       client_secret: '',
-      scopes: server?.connection.scopes ?? '',
       timeout: server?.limits.timeout_seconds ?? 60,
       concurrency: server?.limits.max_concurrency ?? 10,
     },
@@ -179,7 +176,7 @@ export function ServerForm(props: {
         }
       } else if (oauth) {
         connection.client_id = value.client_id
-        connection.scopes = value.scopes
+        connection.scopes = ''
       }
       return mcpRequest<MCPServer>(
         server ? `/servers/${server.id}` : '/servers',
@@ -198,7 +195,7 @@ export function ServerForm(props: {
                   ? { headers }
                   : {}),
                 connection,
-                ...(oauth && (value.client_secret || clearSecret)
+                ...(oauth && value.client_secret
                   ? { client_secret: value.client_secret }
                   : {}),
                 limits: {
@@ -411,29 +408,6 @@ export function ServerForm(props: {
               </FormItem>
             )}
           />
-          <Input
-            type='file'
-            aria-label={t('Import Markdown')}
-            accept='.md,text/markdown'
-            onChange={async (e) => {
-              const file = e.target.files?.[0]
-              if (!file) return
-              if (
-                file.size > 131072 ||
-                !file.name.toLowerCase().endsWith('.md')
-              ) {
-                form.setError('readme', { message: t('Invalid value') })
-                return
-              }
-              try {
-                form.setValue('readme', await file.text(), {
-                  shouldValidate: true,
-                })
-              } catch {
-                form.setError('readme', { message: t('Invalid value') })
-              }
-            }}
-          />
           <details
             onToggle={(event) => setAdvanced(event.currentTarget.open)}
             className='rounded-lg border px-4 py-3'
@@ -449,7 +423,6 @@ export function ServerForm(props: {
                   [
                     ['client_id', t('Client ID')],
                     ['client_secret', t('Client Secret')],
-                    ['scopes', t('OAuth scopes')],
                   ] as const
                 ).map(([name, label]) => (
                   <FormField
@@ -474,16 +447,6 @@ export function ServerForm(props: {
                     )}
                   />
                 ))}
-                {server?.credentials_configured && props.sensitive && (
-                  <Button
-                    type='button'
-                    variant='outline'
-                    aria-pressed={clearSecret}
-                    onClick={() => setClearSecret(!clearSecret)}
-                  >
-                    {t('Clear client secret')}
-                  </Button>
-                )}
                 <p className='text-muted-foreground text-sm'>
                   {t('Redirect URI')}
                 </p>

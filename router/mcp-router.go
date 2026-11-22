@@ -13,7 +13,9 @@ import (
 func SetMCPRouter(engine *gin.Engine) {
 	// Separate groups deliberately omit the management/relay gzip middleware.
 	public := engine.Group("", middleware.RouteTag("mcp"), mcpFeatureGate)
-	public.Any("/mcp/:server_slug", controller.MCPProtocol)
+	public.POST("/v1/auth/app-exchange", middleware.CriticalRateLimit(), controller.MCPAppExchange)
+	public.Any("/mcp/gateway", middleware.GlobalAPIRateLimit(), controller.MCPDelegationAuth, controller.MCPGateway)
+	public.Any("/mcp/:server_slug", middleware.GlobalAPIRateLimit(), controller.MCPDelegationAuth, controller.MCPProtocol)
 	public.POST("/v1/mcp/test/chat/completions", middleware.TokenAuth(), controller.MCPChatTest(engine))
 	public.Any("/mcp/providers/:provider/:instance", controller.MCPLocalProtocol)
 	public.GET("/.well-known/oauth-protected-resource/mcp/providers/:provider/:instance", controller.MCPLocalMetadata)
@@ -26,7 +28,7 @@ func SetMCPRouter(engine *gin.Engine) {
 	api.GET("/catalog", middleware.UserAuth(), controller.MCPCatalog)
 	api.GET("/catalog/:id", middleware.UserAuth(), controller.MCPCatalogDetail)
 	api.GET("/catalog/:id/tools", middleware.UserAuth(), controller.MCPCatalogTools)
-	api.GET("/self/config", middleware.TokenOrUserAuth(), controller.MCPCatalog)
+	api.GET("/self/config", controller.MCPDelegationAuth, controller.MCPGatewayConfig)
 	self := api.Group("/self", middleware.UserAuth(), mcpMutationGuard)
 	self.GET("/installations", controller.MCPCatalog)
 	self.POST("/installations", controller.MCPInstall)
@@ -58,7 +60,7 @@ func SetMCPRouter(engine *gin.Engine) {
 	admin.POST("/servers/:id/discoveries", middleware.RequirePermission(authz.MCPOperate), controller.MCPDiscovery)
 	admin.POST("/servers/:id/tools/sync", middleware.RequirePermission(authz.MCPOperate), controller.MCPToolSync)
 	admin.PATCH("/servers/:id/tools/:tool_id", controller.MCPTool)
-	admin.PUT("/servers/:id/tools/:tool_id/pricing", middleware.RequirePermission(authz.MCPSensitiveWrite), controller.MCPToolPrice)
+	admin.PUT("/servers/:id/tools/:tool_id/pricing", controller.MCPToolPrice)
 	admin.POST("/servers/:id/connection-tests", middleware.RequirePermission(authz.MCPOperate), controller.MCPConnectionTest)
 	admin.POST("/servers/:id/test-authorizations", middleware.RequirePermission(authz.MCPOperate), controller.MCPTestAuthorization)
 	admin.POST("/test-authorizations/callback", middleware.RequirePermission(authz.MCPOperate), controller.MCPTestAuthorizationCallback)

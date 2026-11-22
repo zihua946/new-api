@@ -20,15 +20,17 @@ import (
 )
 
 type Actor struct {
-	Draft          bool
-	InstallationID string
-	UserID         int
-	TokenID        int
-	Group          string
-	Subject        string
-	AccessToken    string
-	ExpiresAt      time.Time
-	CanCall        bool
+	Delegation      *MCPDelegation
+	DelegationToken string
+	Draft           bool
+	InstallationID  string
+	UserID          int
+	TokenID         int
+	Group           string
+	Subject         string
+	AccessToken     string
+	ExpiresAt       time.Time
+	CanCall         bool
 }
 
 var oidcProviders sync.Map
@@ -121,22 +123,39 @@ func AuthenticateOAuth(ctx context.Context, server *model.MCPServer, raw string)
 		return nil, Failure(403, "ORGANIZATION_NOT_ALLOWED", "Authorization organization is not allowed")
 	}
 	clientID, secret := os.Getenv("MCP_OAUTH_CLIENT_ID"), os.Getenv("MCP_OAUTH_CLIENT_SECRET")
-	if clientID == "" || secret == "" {
-		return nil, Failure(503, "MCP_NOT_CONFIGURED", "MCP resource verifier is not configured")
-	}
-	allowedClients := os.Getenv("MCP_OAUTH_ALLOWED_CLIENT_IDS")
-	if allowedClients == "" {
-		allowedClients = clientID
-	}
-	clientAllowed := false
-	for id := range strings.SplitSeq(allowedClients, ",") {
-		if strings.TrimSpace(id) == claims.AuthorizedParty {
-			clientAllowed = true
-			break
+	if server.Catalog && server.Kind == "deepseek" {
+		// Load the authoritative persisted registration, including when the
+		// protocol handler deliberately supplied only a public server view.
+		registered, err := model.GetMCPServer(server.ID)
+		if err != nil || !registered.Catalog || registered.Kind != "deepseek" || ResourceURL(registered) != resource {
+			return nil, Failure(403, "CLIENT_NOT_ALLOWED", "OAuth client is not registered for MCP access")
+		}
+		clientID = registered.Connection.ClientID
+		if clientID == "" || claims.AuthorizedParty != clientID || registered.CredentialCiphertext == "" {
+			return nil, Failure(403, "CLIENT_NOT_ALLOWED", "OAuth client is not registered for MCP access")
+		}
+		secret, err = Open(registered.CredentialCiphertext, "oauth-client:"+registered.ID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		allowedClients := os.Getenv("MCP_OAUTH_ALLOWED_CLIENT_IDS")
+		if allowedClients == "" {
+			allowedClients = clientID
+		}
+		clientAllowed := false
+		for id := range strings.SplitSeq(allowedClients, ",") {
+			if strings.TrimSpace(id) == claims.AuthorizedParty {
+				clientAllowed = true
+				break
+			}
+		}
+		if !clientAllowed {
+			return nil, Failure(403, "CLIENT_NOT_ALLOWED", "OAuth client is not registered for MCP access")
 		}
 	}
-	if !clientAllowed {
-		return nil, Failure(403, "CLIENT_NOT_ALLOWED", "OAuth client is not registered for MCP access")
+	if clientID == "" || secret == "" {
+		return nil, Failure(503, "MCP_NOT_CONFIGURED", "MCP resource verifier is not configured")
 	}
 	form := url.Values{"token": {raw}, "token_type_hint": {"access_token"}, "resource": {resource}}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")+"/api/login/oauth/introspect", strings.NewReader(form.Encode()))
@@ -182,12 +201,16 @@ func AuthenticateOAuth(ctx context.Context, server *model.MCPServer, raw string)
 
 func CanUseTool(server *model.MCPServer, tool *model.MCPTool, actor *Actor, test bool) bool {
 	return actor != nil && (server.Catalog || slices.Contains(server.AllowedUserGroups, actor.Group)) &&
+		(actor.Delegation == nil || actor.Delegation.AllowsServer(server.ID)) &&
 		(tool.AllowedUserGroups == nil || slices.Contains(tool.AllowedUserGroups, actor.Group)) &&
 		!server.Archived && !tool.Removed && !tool.ReviewRequired && (test || server.Enabled && tool.Enabled)
 }
 
 // InstallationActor binds upstream credentials to the platform owner.
 func InstallationActor(ctx context.Context, server *model.MCPServer, actor *Actor, admin bool) (*Actor, error) {
+	if actor.Delegation != nil && (admin || !actor.Delegation.AllowsServer(server.ID)) {
+		return nil, Failure(403, "DELEGATION_ACCESS_DENIED", "The application cannot access this MCP service")
+	}
 	var row *model.MCPInstallation
 	var err error
 	if admin {
@@ -225,6 +248,10 @@ func InstallationActor(ctx context.Context, server *model.MCPServer, actor *Acto
 		}
 		copy = *verified
 		copy.TokenID = actor.TokenID
+		copy.Delegation, copy.DelegationToken = actor.Delegation, actor.DelegationToken
+		if !actor.ExpiresAt.IsZero() && actor.ExpiresAt.Before(copy.ExpiresAt) {
+			copy.ExpiresAt = actor.ExpiresAt
+		}
 	} else {
 		copy.AccessToken = token
 	}

@@ -196,6 +196,10 @@ func MCPConnectionInfo(c *gin.Context) {
 		mcpResponse(c, 0, nil, err)
 		return
 	}
+	if server.Catalog {
+		mcpResponse(c, 200, gin.H{"url": mcpsvc.PublicBaseURL() + "/mcp/" + server.ID, "gateway_url": mcpsvc.PublicBaseURL() + "/mcp/gateway", "app_exchange_url": mcpsvc.PublicBaseURL() + "/v1/auth/app-exchange", "transport": "streamable_http", "auth_mode": "mcp_delegation", "enabled": server.Enabled}, nil)
+		return
+	}
 	mcpResponse(c, 200, gin.H{"url": mcpsvc.ResourceURL(server), "transport": "streamable_http", "auth_mode": server.AuthMode, "enabled": server.Enabled, "metadata_url": mcpsvc.PublicBaseURL() + "/.well-known/oauth-protected-resource/mcp/" + server.Slug}, nil)
 }
 
@@ -234,6 +238,10 @@ func MCPTool(c *gin.Context) {
 }
 
 func MCPToolPrice(c *gin.Context) {
+	if !authz.Can(c.GetInt("id"), c.GetInt("role"), authz.MCPWrite) && !authz.Can(c.GetInt("id"), c.GetInt("role"), authz.MCPSensitiveWrite) {
+		mcpResponse(c, 0, nil, mcpsvc.Failure(403, "PERMISSION_DENIED", "MCP editing permission is required"))
+		return
+	}
 	var input struct {
 		ExpectedRevision int64   `json:"expected_revision"`
 		Mode             string  `json:"mode"`
@@ -484,10 +492,8 @@ func MCPProtocol(c *gin.Context) {
 		mcpResponse(c, 0, nil, mcpsvc.Failure(403, "ORIGIN_NOT_ALLOWED", "Request origin is not allowed"))
 		return
 	}
-	actor, err := mcpsvc.Authenticate(c.Request.Context(), server, c.GetHeader("Authorization"), c.ClientIP())
-	if err == nil {
-		actor, err = mcpsvc.InstallationActor(c.Request.Context(), server, actor, false)
-	}
+	delegated := c.MustGet("mcp_delegated_actor").(*mcpsvc.Actor)
+	actor, err := mcpsvc.InstallationActor(c.Request.Context(), server, delegated, false)
 	if err != nil {
 		mcpResponse(c, 0, nil, err)
 		return

@@ -14,7 +14,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
@@ -110,8 +109,10 @@ func taskAdjustFunding(task *model.Task, delta int) error {
 	if taskIsSubscription(task) {
 		return model.PostConsumeUserSubscriptionDelta(task.PrivateData.SubscriptionId, int64(delta))
 	}
-	operationID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("task:%d:%s:wallet:%d:%d", task.ID, task.TaskID, task.Quota, delta))).String()
-	return model.AdjustQuotaWithID(operationID, task.BillingPayerID(), 0, -delta)
+	if delta > 0 {
+		return model.DecreaseUserQuota(task.BillingPayerID(), delta, false)
+	}
+	return model.IncreaseUserQuota(task.BillingPayerID(), -delta, false)
 }
 
 // taskAdjustTokenQuota 调整任务的令牌额度，delta > 0 表示扣费，delta < 0 表示退还。
@@ -124,8 +125,12 @@ func taskAdjustTokenQuota(ctx context.Context, task *model.Task, delta int) {
 	if tokenKey == "" {
 		return
 	}
-	operationID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("task:%d:%s:token:%d:%d", task.ID, task.TaskID, task.Quota, delta))).String()
-	err := model.AdjustQuotaWithID(operationID, 0, task.PrivateData.TokenId, -delta)
+	var err error
+	if delta > 0 {
+		err = model.DecreaseTokenQuota(task.PrivateData.TokenId, tokenKey, delta)
+	} else {
+		err = model.IncreaseTokenQuota(task.PrivateData.TokenId, tokenKey, -delta)
+	}
 	if err != nil {
 		logger.LogWarn(ctx, fmt.Sprintf("调整令牌额度失败 (delta=%d, task=%s): %s", delta, task.TaskID, err.Error()))
 	}

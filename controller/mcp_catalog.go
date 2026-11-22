@@ -14,16 +14,22 @@ import (
 	"gorm.io/gorm"
 )
 
+type mcpClientConnection struct {
+	Type string `json:"type"`
+	URL  string `json:"url"`
+}
+
 type mcpCatalogItem struct {
-	Icon         model.MCPEncryptedResult `json:"icon,omitempty"`
-	ID           string                   `json:"id"`
-	Name         string                   `json:"name"`
-	Description  string                   `json:"description"`
-	Version      string                   `json:"version"`
-	AuthMode     string                   `json:"auth_mode"`
-	Enabled      bool                     `json:"enabled"`
-	Installation *model.MCPInstallation   `json:"installation,omitempty"`
-	URL          string                   `json:"url,omitempty"`
+	Icon             model.MCPEncryptedResult `json:"icon,omitempty"`
+	ID               string                   `json:"id"`
+	Name             string                   `json:"name"`
+	Description      string                   `json:"description"`
+	Version          string                   `json:"version"`
+	AuthMode         string                   `json:"auth_mode"`
+	Enabled          bool                     `json:"enabled"`
+	Installation     *model.MCPInstallation   `json:"installation,omitempty"`
+	ClientConnection *mcpClientConnection     `json:"client_connection,omitempty"`
+	URL              string                   `json:"url,omitempty"`
 }
 
 func MCPCatalog(c *gin.Context) {
@@ -50,18 +56,9 @@ func MCPCatalog(c *gin.Context) {
 		owned[item.ServerID] = item
 		ids = append(ids, item.ServerID)
 	}
-	q := model.DB.Model(&model.MCPServer{}).Where("catalog = ?", true)
-	switch c.FullPath() {
-	case "/api/mcp/self/config":
-		q = q.Where("enabled = ? AND archived = ?", true, false).Where(`EXISTS (
-			SELECT 1 FROM mcp_installations i WHERE i.server_id = mcp_servers.id AND i.user_id = ? AND i.admin = ?
-			AND i.authorized = ? AND i.connection_revision = mcp_servers.connection_revision
-            AND (mcp_servers.kind <> ? OR ?))`, userID, false, true, "public_knowledge", engineAuthorized)
-
-	case "/api/mcp/self/installations":
+	q := model.DB.Model(&model.MCPServer{}).Where("catalog = ? AND enabled = ? AND archived = ?", true, true, false)
+	if c.FullPath() == "/api/mcp/self/installations" {
 		q = q.Where("id IN ?", ids)
-	default:
-		q = q.Where("(enabled = ? AND archived = ?) OR id IN ?", true, false, ids)
 	}
 	if name := c.Query("name"); name != "" {
 		q = q.Where("name LIKE ?", "%"+name+"%")
@@ -77,7 +74,7 @@ func MCPCatalog(c *gin.Context) {
 	}
 	items := make([]mcpCatalogItem, 0, len(rows))
 	for _, server := range rows {
-		item := mcpCatalogItem{Icon: server.Icon, ID: server.ID, Name: server.Name, Description: server.Description, Version: server.Version, AuthMode: server.AuthMode, Enabled: server.Enabled && !server.Archived, Installation: owned[server.ID]}
+		item := mcpCatalogItem{Icon: server.Icon, ID: server.ID, Name: server.Name, Description: server.Description, Version: server.Version, AuthMode: server.AuthMode, Enabled: server.Enabled && !server.Archived, Installation: owned[server.ID], ClientConnection: &mcpClientConnection{Type: "streamable-http", URL: mcpsvc.PublicBaseURL() + "/mcp/" + server.ID}}
 		if item.Installation != nil {
 			item.Installation.Authorized = item.Installation.Authorized && item.Installation.ConnectionRevision == server.ConnectionRevision
 			if server.Kind == "public_knowledge" {
@@ -87,12 +84,17 @@ func MCPCatalog(c *gin.Context) {
 				item.URL = mcpsvc.PublicBaseURL() + "/mcp/" + server.ID
 			}
 		}
-		if c.FullPath() == "/api/mcp/self/config" && item.URL == "" {
-			continue
+		if server.Kind == "remote_mcp" && server.Connection.URL != "" {
+			switch server.Connection.Transport {
+			case "streamable_http":
+				item.ClientConnection = &mcpClientConnection{Type: "streamable-http", URL: server.Connection.URL}
+			case "http_sse":
+				item.ClientConnection = &mcpClientConnection{Type: "sse", URL: server.Connection.URL}
+			}
 		}
 		items = append(items, item)
 	}
-	mcpResponse(c, 200, gin.H{"items": items, "total": total, "page": page, "page_size": size, "authentication": "bearer_new_api_key"}, nil)
+	mcpResponse(c, 200, gin.H{"items": items, "total": total, "page": page, "page_size": size, "authentication": "bearer_mcp_delegation"}, nil)
 }
 
 func MCPCatalogTools(c *gin.Context) {

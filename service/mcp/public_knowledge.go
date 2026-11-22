@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -68,48 +67,14 @@ func publicLibraryClient(ctx context.Context, server *model.MCPServer, actor *Ac
 		return nil, Failure(503, "ENGINE_APP_NOT_CONFIGURED", "Configure the trusted knowledge application")
 	}
 	defer client.CloseIdleConnections()
-	body, err := common.Marshal(map[string]string{"access_token": app.AccessToken})
+	entry, cacheKey, err := knowledgeEngineToken(ctx, actor.UserID, subject, base, clientID, secret, app, time.Duration(server.Limits.TimeoutSeconds)*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/auth/app-exchange", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.SetBasicAuth(clientID, secret)
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, Failure(503, "ENGINE_UNAVAILABLE", "Knowledge engine is temporarily unavailable")
-	}
-	defer response.Body.Close()
-	if response.StatusCode != 200 {
-		if response.StatusCode == 401 || response.StatusCode == 403 {
-			var failure struct{ Detail string }
-			_ = common.DecodeJson(response.Body, &failure)
-			switch failure.Detail {
-			case "Invalid application credentials", "Application authentication required", "Unknown application", "Application is not enabled", "Application is not configured", "Invalid application audience", "Delegated applications require an independent client ID":
-				return nil, Failure(503, "ENGINE_APP_NOT_CONFIGURED", "Verify the trusted application registration and exchange credentials")
-			}
-			return nil, Failure(401, "ENGINE_AUTHORIZATION_REQUIRED", "Authorize the knowledge application again")
-		}
-		return nil, Failure(503, "ENGINE_UNAVAILABLE", "Knowledge engine is temporarily unavailable")
-	}
-	var token struct {
-		AccessToken string `json:"access_token"`
-		TokenType   string `json:"token_type"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-	if common.DecodeJson(response.Body, &token) != nil || !strings.EqualFold(token.TokenType, "Bearer") || token.AccessToken == "" || token.ExpiresIn <= 0 || token.ExpiresIn > 3600 {
-		return nil, Failure(502, "TOKEN_EXCHANGE_FAILED", "Invalid knowledge engine authorization response")
-	}
-	expires := time.Now().Add(time.Duration(token.ExpiresIn) * time.Second)
-	if app.Expiry.Before(expires) {
-		expires = app.Expiry
-	}
+	expires := entry.expires
 	configured := *server
 	configured.Connection.EngineBaseURL = base
-	engine := &publicEngine{knowledgeClient: knowledgeClient{server: &configured, client: client, token: token.AccessToken}, expires: expires}
+	engine := &publicEngine{knowledgeClient: knowledgeClient{server: &configured, client: client, token: entry.token, engineTokenCacheKey: cacheKey}, expires: expires}
 	check, cancel := context.WithDeadline(ctx, expires)
 	defer cancel()
 	var library struct {
@@ -212,6 +177,7 @@ func (engine *publicEngine) snapshot(ctx context.Context, taskID string, progres
 		return nil, Failure(404, "RESOURCE_NOT_FOUND", "Consultation is unavailable")
 	}
 	if resp.StatusCode == 401 {
+		knowledgeEngineTokens.invalidate(engine.engineTokenCacheKey, engine.token)
 		return nil, Failure(401, "ENGINE_AUTHORIZATION_REQUIRED", "Reconnect the knowledge application")
 	}
 	if resp.StatusCode != 200 || !strings.EqualFold(strings.TrimSpace(strings.SplitN(resp.Header.Get("Content-Type"), ";", 2)[0]), "text/event-stream") {

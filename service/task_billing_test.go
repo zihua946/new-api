@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -47,7 +46,6 @@ func TestMain(m *testing.M) {
 
 	if err := db.AutoMigrate(
 		&model.Task{},
-		&model.QuotaOperation{},
 		&model.User{},
 		&model.Token{},
 		&model.Log{},
@@ -71,7 +69,6 @@ func TestMain(m *testing.M) {
 func truncate(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
-		model.DB.Exec("DELETE FROM quota_operations")
 		model.DB.Exec("DELETE FROM tasks")
 		model.DB.Exec("DELETE FROM users")
 		model.DB.Exec("DELETE FROM tokens")
@@ -1806,36 +1803,4 @@ func TestMidjourneyTeamRefundRetainsPayerAfterReload(t *testing.T) {
 	assert.Equal(t, 9, log.BillingUnitId)
 	require.True(t, RefundMidjourneyQuota(context.Background(), &persisted, "duplicate"))
 	assert.Equal(t, 1000, getUserQuota(t, 2))
-}
-
-func TestWalletSettlementRecoveryDoesNotRepeatOrRefund(t *testing.T) {
-	truncate(t)
-	const userID, tokenID = 8701, 8702
-	seedUser(t, userID, 900)
-	seedToken(t, tokenID, userID, "quota-recovery-test", 900)
-	info := &relaycommon.RelayInfo{UserId: userID, TokenId: tokenID, TokenKey: "quota-recovery-test"}
-	session := &BillingSession{relayInfo: info, funding: &WalletFunding{userId: userID, consumed: 100}, preConsumedQuota: 100, tokenConsumed: 100}
-	failed := false
-	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("test:settlement_commit", func(tx *gorm.DB) {
-		updates, _ := tx.Statement.Dest.(map[string]any)
-		if !failed && tx.Statement.Table == "quota_operations" && updates["state"] == "applied" {
-			failed = true
-			tx.AddError(errors.New("settlement commit interrupted"))
-		}
-	}))
-	t.Cleanup(func() { _ = model.DB.Callback().Update().Remove("test:settlement_commit") })
-	var pending *model.QuotaOperationPending
-	require.ErrorAs(t, session.Settle(150), &pending)
-	require.True(t, failed)
-	assert.False(t, session.NeedsRefund(), "recovery owns the accepted settlement")
-	session.Refund(nil)
-	_, err := model.RecoverQuotaOperations(context.Background(), time.Now().UTC())
-	require.NoError(t, err)
-	require.NoError(t, session.Settle(150))
-	var user model.User
-	var token model.Token
-	require.NoError(t, model.DB.First(&user, userID).Error)
-	require.NoError(t, model.DB.First(&token, tokenID).Error)
-	assert.Equal(t, 850, user.Quota)
-	assert.Equal(t, 850, token.RemainQuota)
 }

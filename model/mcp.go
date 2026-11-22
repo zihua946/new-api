@@ -237,7 +237,7 @@ func (server *MCPServer) AfterFind(*gorm.DB) error {
 	if server.Catalog {
 		if server.Kind == "public_knowledge" {
 			server.AuthMode = "engine_app"
-		} else if server.Connection.ClientID != "" {
+		} else if server.Kind == "deepseek" || server.Connection.ClientID != "" {
 			server.AuthMode = "oauth2"
 		}
 	} else if server.Kind == "deepseek" {

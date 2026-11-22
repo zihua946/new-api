@@ -69,18 +69,48 @@ func ServeProtocol(w http.ResponseWriter, r *http.Request, server *model.MCPServ
 	if err != nil {
 		return err
 	}
-	sdk := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "new-api", Version: "1.0.0"}, nil)
+	bindings := make([]protocolTool, 0, len(tools))
 	for _, view := range tools {
-		tool := view.MCPTool
-		if !CanUseTool(server, &tool, actor, false) || server.Catalog && view.Pricing == nil {
-			continue
+		if CanUseTool(server, &view.MCPTool, actor, false) && (!server.Catalog || view.Pricing != nil) {
+			bindings = append(bindings, protocolTool{server: server, actor: actor, tool: view.MCPTool, name: view.Name})
 		}
+	}
+	return serveProtocolTools(w, r, bindings)
+}
 
-		definition := &mcpsdk.Tool{Name: tool.Name, Description: tool.Description, InputSchema: tool.InputSchema}
+type protocolTool struct {
+	server *model.MCPServer
+	actor  *Actor
+	tool   model.MCPTool
+	name   string
+}
+
+// A gateway is both an MCP server and an MCP client. The SDK puts downstream
+// protocol/session state in context values; forwarding those values can override
+// the independent upstream version negotiation (notably legacy HTTP sessions).
+// Keep cancellation/deadlines and our request trace, but not SDK connection state.
+type mcpExecutionContext struct{ context.Context }
+
+func (ctx mcpExecutionContext) Value(key any) any {
+	if key == common.RequestIdKey {
+		return ctx.Context.Value(key)
+	}
+	return nil
+}
+
+// Shared by the existing single-service endpoint and the delegated gateway, so
+// tool validation, upstream execution, idempotency and settlement remain identical.
+func serveProtocolTools(w http.ResponseWriter, r *http.Request, bindings []protocolTool) error {
+	sdk := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "new-api", Version: "1.0.0"}, nil)
+	for _, binding := range bindings {
+		server, actor, tool := binding.server, binding.actor, binding.tool
+
+		definition := &mcpsdk.Tool{Name: binding.name, Description: tool.Description, InputSchema: tool.InputSchema}
 		if len(tool.OutputSchema) > 0 {
 			definition.OutputSchema = tool.OutputSchema
 		}
 		sdk.AddTool(definition, func(ctx context.Context, request *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+			ctx = mcpExecutionContext{ctx}
 			var arguments map[string]any
 			if len(request.Params.Arguments) != 0 {
 				if common.Unmarshal(request.Params.Arguments, &arguments) != nil {
@@ -91,7 +121,7 @@ func ServeProtocol(w http.ResponseWriter, r *http.Request, server *model.MCPServ
 			if request.Extra != nil {
 				key = request.Extra.Header.Get("Idempotency-Key")
 			}
-			if server.Catalog && server.Kind == "remote_mcp" && envelope.Method != "tools/call" {
+			if server.Catalog && server.Kind == "remote_mcp" {
 				views, err := AvailableTools(ctx, server, actor)
 				if err != nil {
 					return ProtocolFailure(err)
