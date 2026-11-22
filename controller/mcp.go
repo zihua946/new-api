@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -366,19 +367,53 @@ func MCPTestInvocation(c *gin.Context) {
 		return
 	}
 	response := gin.H{"invocation_id": call.Invocation.ID, "status": call.Invocation.Status}
+	if strings.Contains(c.GetHeader("Accept"), "text/event-stream") {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-store")
+		c.Header("X-Accel-Buffering", "no")
+		// Keep the durable invocation running if the browser disconnects. A
+		// subsequent result read or idempotent retry never executes it twice.
+		send := func(event string, value any) {
+			if c.Request.Context().Err() != nil {
+				return
+			}
+			data, err := common.Marshal(value)
+			if err != nil {
+				return
+			}
+			if _, err = fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, data); err == nil {
+				c.Writer.Flush()
+			}
+		}
+		send("invocation", response)
+		if call.Created {
+			var count int
+			runMCPTest(call, func(message string, details ...map[string]any) error {
+				count++
+				params := gin.H{"progressToken": call.Invocation.ID, "progress": count, "message": message}
+				if len(details) > 0 {
+					params["_meta"] = gin.H{"knowyet.com/consultation": details[0]}
+				}
+				send("message", gin.H{"jsonrpc": "2.0", "method": "notifications/progress", "params": params})
+				return nil
+			})
+		}
+		send("complete", response)
+		return
+	}
 	if call.Created {
-		go runMCPTest(call)
+		go runMCPTest(call, nil)
 	}
 	mcpResponse(c, 202, response, nil)
 }
 
-func runMCPTest(call *mcpsvc.PreparedCall) {
+func runMCPTest(call *mcpsvc.PreparedCall, progress mcpsvc.Progress) {
 	defer func() {
 		if recover() != nil {
 			common.SysError("MCP test worker interrupted; durable recovery will reconcile the invocation")
 		}
 	}()
-	_, _ = call.Run(context.Background(), nil)
+	_, _ = call.Run(context.Background(), progress)
 }
 
 func MCPTestResult(c *gin.Context) {

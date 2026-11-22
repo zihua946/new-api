@@ -37,7 +37,7 @@ var oidcProviders sync.Map
 
 func oauthProvider(ctx context.Context) (*oidc.Provider, *http.Client, error) {
 	issuer := strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")
-	client, err := NewHTTPClient(issuer, 10*time.Second)
+	client, err := requestHTTPClient(ctx, issuer, 10*time.Second)
 	if err != nil {
 		return nil, nil, Failure(503, "MCP_NOT_CONFIGURED", "MCP authorization provider is not configured")
 	}
@@ -138,7 +138,7 @@ func AuthenticateOAuth(ctx context.Context, server *model.MCPServer, raw string)
 		if err != nil {
 			return nil, err
 		}
-	} else {
+	} else if server.Kind != "public_knowledge" {
 		allowedClients := os.Getenv("MCP_OAUTH_ALLOWED_CLIENT_IDS")
 		if allowedClients == "" {
 			allowedClients = clientID
@@ -170,19 +170,24 @@ func AuthenticateOAuth(ctx context.Context, server *model.MCPServer, raw string)
 	}
 	defer response.Body.Close()
 	var active struct {
-		Active   bool             `json:"active"`
-		Subject  string           `json:"sub"`
-		ClientID string           `json:"client_id"`
-		Scope    string           `json:"scope"`
-		Issuer   string           `json:"iss"`
-		Audience jwt.ClaimStrings `json:"aud"`
-		Exp      int64            `json:"exp"`
+		ClientOrganization string           `json:"client_organization"`
+		ClientDynamicMCP   bool             `json:"client_dynamic_mcp"`
+		Active             bool             `json:"active"`
+		Subject            string           `json:"sub"`
+		ClientID           string           `json:"client_id"`
+		Scope              string           `json:"scope"`
+		Issuer             string           `json:"iss"`
+		Audience           jwt.ClaimStrings `json:"aud"`
+		Exp                int64            `json:"exp"`
 	}
 	if response.StatusCode != http.StatusOK || common.DecodeJson(response.Body, &active) != nil {
 		return nil, Failure(503, "AUTHORIZATION_UNAVAILABLE", "Authorization state cannot be verified")
 	}
 	if !active.Active || active.Issuer != strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/") || len(active.Audience) != 1 || active.Audience[0] != resource || active.Subject != verified.Subject || active.ClientID != claims.AuthorizedParty || active.Exp <= time.Now().Unix() || !slices.Contains(strings.Fields(active.Scope), "mcp:tools:read") {
 		return nil, Failure(401, "AUTHORIZATION_REVOKED", "Authorization is no longer active")
+	}
+	if server.Kind == "public_knowledge" && (!active.ClientDynamicMCP || active.ClientOrganization != organization) {
+		return nil, Failure(403, "CLIENT_NOT_ALLOWED", "OAuth client is not an active dynamic MCP registration in the trusted organization")
 	}
 	user, err := casdoorUser(verified.Subject)
 	if err != nil {

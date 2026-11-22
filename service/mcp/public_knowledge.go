@@ -25,6 +25,29 @@ func libraryPath(server *model.MCPServer, suffix string) string {
 	return "/v1/knowledge/kb/" + url.PathEscape(server.Connection.KBID) + suffix + "?" + url.Values{"owner": {server.Connection.Owner}}.Encode()
 }
 
+// PublicLibraryURL identifies a fixed library independently of its catalog row.
+func PublicLibraryURL(owner, kbID string) string {
+	return PublicBaseURL() + "/mcp/providers/knowledge/" + url.PathEscape(owner) + "/" + url.PathEscape(kbID)
+}
+
+func publicLibraryConnection(endpoint string) (model.MCPConnection, bool) {
+	base := PublicBaseURL()
+	path, ok := strings.CutPrefix(endpoint, base+"/mcp/providers/knowledge/")
+	if base == "" || !ok {
+		return model.MCPConnection{}, false
+	}
+	owner, kbID, ok := strings.Cut(path, "/")
+	if !ok {
+		return model.MCPConnection{}, false
+	}
+	owner, ownerErr := url.PathUnescape(owner)
+	kbID, kbErr := url.PathUnescape(kbID)
+	if ownerErr != nil || kbErr != nil || !libraryIdentifier(owner) || !libraryIdentifier(kbID) || endpoint != PublicLibraryURL(owner, kbID) {
+		return model.MCPConnection{}, false
+	}
+	return model.MCPConnection{URL: endpoint, Transport: "streamable_http", Owner: owner, KBID: kbID}, true
+}
+
 type publicEngine struct {
 	knowledgeClient
 	expires time.Time
@@ -62,7 +85,7 @@ func publicLibraryClient(ctx context.Context, server *model.MCPServer, actor *Ac
 	}
 	base := strings.TrimRight(os.Getenv("MCP_KNOWLEDGE_ENGINE_URL"), "/")
 	clientID, secret := os.Getenv("MCP_KNOWLEDGE_CLIENT_ID"), os.Getenv("MCP_KNOWLEDGE_CLIENT_SECRET")
-	client, err := NewHTTPClient(base, time.Duration(server.Limits.TimeoutSeconds)*time.Second)
+	client, err := requestHTTPClient(ctx, base, time.Duration(server.Limits.TimeoutSeconds)*time.Second)
 	if err != nil || clientID == "" || secret == "" {
 		return nil, Failure(503, "ENGINE_APP_NOT_CONFIGURED", "Configure the trusted knowledge application")
 	}
@@ -91,6 +114,9 @@ func publicLibraryClient(ctx context.Context, server *model.MCPServer, actor *Ac
 }
 
 func executePublicLibrary(ctx context.Context, server *model.MCPServer, tool *model.MCPTool, actor *Actor, args map[string]any, progress Progress) (Outcome, error) {
+	pool := &requestHTTPPool{}
+	defer pool.Close()
+	ctx = context.WithValue(ctx, requestHTTPPoolKey{}, pool)
 	// Validate ownership before contacting any engine business route.
 	taskID, _ := args["task_id"].(string)
 	sessionID, _ := args["session_id"].(string)
@@ -118,11 +144,19 @@ func executePublicLibrary(ctx context.Context, server *model.MCPServer, tool *mo
 		return Outcome{}, err
 	}
 	defer engine.client.CloseIdleConnections()
-	business, cancel := context.WithDeadline(ctx, engine.expires)
+	expires := engine.expires
+	if !actor.ExpiresAt.IsZero() && actor.ExpiresAt.Before(expires) {
+		expires = actor.ExpiresAt
+	}
+	business, cancel := context.WithDeadline(ctx, expires)
 	defer cancel()
 	var data map[string]any
 	if tool.Name == "create_consultation" {
-		key := Digest(server.ID + "\x00" + strconv.Itoa(actor.UserID) + "\x00" + args["request_id"].(string))
+		requestID, _ := args["request_id"].(string)
+		if requestID == "" {
+			requestID = common.NewRequestId()
+		}
+		key := Digest(server.ID + "\x00" + strconv.Itoa(actor.UserID) + "\x00" + requestID)
 		payload := map[string]any{"question": args["question"]}
 		if sessionID != "" {
 			payload["session_id"] = sessionID
@@ -145,22 +179,32 @@ func executePublicLibrary(ctx context.Context, server *model.MCPServer, tool *mo
 		}
 		data = map[string]any{"task_id": taskID, "session_id": acceptedSession}
 	} else {
+		// Authorization belongs to this bounded invocation, not individual deltas.
 		data, err = engine.snapshot(business, taskID, progress)
 		if err != nil {
 			return Outcome{}, err
 		}
 	}
-	// The stream window is bounded. Recheck the grant, publication and public
-	// flag immediately before delivering any newly read or accepted information.
-	if _, err = publicLibraryClient(ctx, server, actor); err != nil {
+	if err = business.Err(); err != nil {
 		return Outcome{Unknown: tool.Name == "create_consultation"}, err
 	}
+	// Creation retains its post-acceptance check; result reads authorize once.
+	if tool.Name == "create_consultation" {
+		if _, err = publicLibraryClient(ctx, server, actor); err != nil {
+			return Outcome{Unknown: true}, err
+		}
+	}
+
 	result, err := StructuredResult(data)
 	return Outcome{Result: result, Billable: true}, err
 }
 
 func (engine *publicEngine) snapshot(ctx context.Context, taskID string, progress Progress) (map[string]any, error) {
-	window, cancel := context.WithTimeout(ctx, 5*time.Second)
+	timeout := 5 * time.Second
+	if progress != nil {
+		timeout = time.Duration(engine.server.Limits.TimeoutSeconds) * time.Second
+	}
+	window, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(window, http.MethodGet, engine.server.Connection.EngineBaseURL+"/v1/tasks/"+url.PathEscape(taskID)+"/stream", nil)
 	if err != nil {
@@ -191,6 +235,9 @@ func (engine *publicEngine) snapshot(ctx context.Context, taskID string, progres
 	done := false
 	invalid := Failure(502, "INVALID_UPSTREAM_RESULT", "Invalid or incomplete knowledge task stream")
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		line := scanner.Text()
 		if value, ok := strings.CutPrefix(line, "data:"); ok {
 			if frame.Len() > 0 {
@@ -212,6 +259,11 @@ func (engine *publicEngine) snapshot(ctx context.Context, taskID string, progres
 				return nil, invalid
 			}
 			status = event["status"].(string)
+			if progress != nil {
+				if err := progress("Consultation connected", map[string]any{"task_id": taskID, "type": "status", "status": status}); err != nil {
+					return nil, err
+				}
+			}
 			continue
 		}
 		if status == "" {
@@ -223,13 +275,12 @@ func (engine *publicEngine) snapshot(ctx context.Context, taskID string, progres
 			if !ok {
 				return nil, invalid
 			}
+			if answer.Len()+len(text) > MaxResultBytes {
+				return nil, invalid
+			}
 			answer.WriteString(text)
 		case "citation":
 			citations = append(citations, projectKnowledgeEvent(event))
-		case "execution_progress":
-			if progress != nil {
-				progress("Consultation is running")
-			}
 		case "completed":
 			status, done = "completed", true
 		case "error":
@@ -237,6 +288,17 @@ func (engine *publicEngine) snapshot(ctx context.Context, taskID string, progres
 				status = "failed"
 			}
 			done = true
+		}
+		if progress != nil {
+			if projected := projectKnowledgeEvent(event); projected != nil {
+				projected["task_id"] = taskID
+				if done {
+					projected["status"] = status
+				}
+				if err := progress("Consultation update", projected); err != nil {
+					return nil, err
+				}
+			}
 		}
 		if done {
 			break

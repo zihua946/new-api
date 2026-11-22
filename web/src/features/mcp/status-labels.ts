@@ -22,6 +22,9 @@ export function useMCPStatusLabels(): Record<string, string> {
   const { t } = useTranslation()
   return {
     accepted: t('Accepted'),
+    queued: t('Queued'),
+    completed: t('Completed'),
+    cancelled: t('Cancelled'),
     running: t('Running'),
     succeeded: t('Succeeded'),
     failed: t('Failed'),

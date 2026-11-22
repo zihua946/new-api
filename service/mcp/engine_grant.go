@@ -175,7 +175,7 @@ func loadEngineGrant(ctx context.Context, userID int) (*oauth2.Token, string, er
 			return nil, "", Failure(409, "AUTHORIZATION_REFRESH_BUSY", "Authorization is being refreshed")
 		}
 		defer model.DB.Model(&row).Where("refresh_claim = ?", claim).Updates(map[string]any{"refresh_claim": "", "refresh_until": nil})
-		client, err := NewHTTPClient(cfg.Endpoint.TokenURL, 15*time.Second)
+		client, err := requestHTTPClient(ctx, cfg.Endpoint.TokenURL, 15*time.Second)
 		if err != nil {
 			return nil, "", err
 		}

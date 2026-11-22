@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -131,4 +132,56 @@ func (b *boundedResponseBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	b.remaining -= int64(n)
 	return n, err
+}
+
+// requestHTTPPool owns connections for one tool invocation, never credentials or
+// authorization decisions. Origin and timeout policies remain isolated.
+type requestHTTPPool struct {
+	mu      sync.Mutex
+	clients map[string]*http.Client
+	closed  bool
+}
+type requestHTTPPoolKey struct{}
+
+// borrowedTransport leaves connection cleanup to the invocation owner.
+type borrowedTransport struct{ http.RoundTripper }
+
+func (pool *requestHTTPPool) Close() {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	pool.closed = true
+	for _, client := range pool.clients {
+		client.CloseIdleConnections()
+	}
+}
+
+func requestHTTPClient(ctx context.Context, endpoint string, timeout time.Duration) (*http.Client, error) {
+	pool, ok := ctx.Value(requestHTTPPoolKey{}).(*requestHTTPPool)
+	if !ok {
+		return NewHTTPClient(endpoint, timeout)
+	}
+	u, err := ValidateEndpoint(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	key := strings.ToLower(u.Scheme+"://"+u.Host) + "\x00" + timeout.String() + "\x00" + os.Getenv("MCP_ALLOWED_UPSTREAM_ORIGINS")
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.closed {
+		return NewHTTPClient(endpoint, timeout)
+	}
+	client := pool.clients[key]
+	if client == nil {
+		client, err = NewHTTPClient(endpoint, timeout)
+		if err != nil {
+			return nil, err
+		}
+		if pool.clients == nil {
+			pool.clients = make(map[string]*http.Client)
+		}
+		pool.clients[key] = client
+	}
+	borrowed := *client
+	borrowed.Transport = borrowedTransport{client.Transport}
+	return &borrowed, nil
 }

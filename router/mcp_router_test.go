@@ -93,6 +93,31 @@ func TestMCPManagementHTTPContract(t *testing.T) {
 		engine.ServeHTTP(w, r)
 		return w
 	}
+	t.Run("public library URLs expose only registered enabled bindings", func(t *testing.T) {
+		for _, kbID := range []string{"manual", "second-manual"} {
+			endpoint := mcpsvc.PublicLibraryURL("library-owner", kbID)
+			created, err := mcpsvc.CreateServer(mcpsvc.ServerInput{Name: kbID, Connection: model.MCPConnection{Transport: "streamable_http", URL: endpoint}})
+			require.NoError(t, err)
+			path := "/mcp/providers/knowledge/library-owner/" + kbID
+			metadata := "/.well-known/oauth-protected-resource" + path
+			assert.Equal(t, 404, request("GET", metadata, "", "", "", "").Code)
+			// This fixture isolates endpoint routing; publication checks are covered by service tests.
+			require.NoError(t, model.DB.Model(created).Update("enabled", true).Error)
+			reply := request("GET", metadata, "", "", "", "")
+			require.Equal(t, 200, reply.Code)
+			var resource map[string]any
+			require.NoError(t, common.Unmarshal(reply.Body.Bytes(), &resource))
+			assert.Equal(t, endpoint, resource["resource"])
+			unauthorized := request("POST", path, "", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, "", "")
+			assert.Equal(t, 401, unauthorized.Code)
+			assert.Contains(t, unauthorized.Header().Get("WWW-Authenticate"), metadata)
+			assert.Equal(t, 404, request("POST", "/mcp/providers/knowledge/"+created.ID, "", `{}`, "", "").Code)
+		}
+		for _, path := range []string{"/mcp/providers/knowledge", "/mcp/providers/knowledge/library-owner/unknown", "/mcp/providers/knowledge/other-owner/manual"} {
+			assert.Equal(t, 404, request("GET", "/.well-known/oauth-protected-resource"+path, "", "", "", "").Code)
+			assert.Equal(t, 404, request("POST", path, "", `{}`, "", "").Code)
+		}
+	})
 	create := `{"slug":"remote-test","name":"Remote","kind":"remote_mcp","allowed_user_groups":["default"],"connection":{"url":"https://example.com/mcp","transport":"streamable_http"}}`
 	for _, tc := range []struct {
 		identity, origin, guard string
@@ -344,6 +369,45 @@ func TestMCPManagementHTTPContract(t *testing.T) {
 		require.Positive(t, calls[0].ChargedQuota)
 		require.NoError(t, model.DB.First(&user, user.Id).Error)
 		assert.Equal(t, 10000-calls[0].ChargedQuota, user.Quota)
+		t.Run("streaming test submission preserves billing and replay", func(t *testing.T) {
+			var invocationID string
+			payload := `{"tool_name":"echo","arguments":{},"expected_tool_revision":1,"max_charge_quota":500}`
+			for range 2 {
+				r := httptest.NewRequest("POST", "/api/mcp/self/servers/"+server.ID+"/test-invocations", strings.NewReader(payload))
+				r.Header.Set("Authorization", "Bearer management-user")
+				r.Header.Set("X-MCP-Request", "1")
+				r.Header.Set("Accept", "text/event-stream")
+				r.Header.Set("Idempotency-Key", "stream-test")
+				w := httptest.NewRecorder()
+				engine.ServeHTTP(w, r)
+				require.Equal(t, 200, w.Code, w.Body.String())
+				assert.Equal(t, "text/event-stream", w.Header().Get("Content-Type"))
+				assert.True(t, w.Flushed)
+				assert.Contains(t, w.Body.String(), "event: invocation")
+				assert.Contains(t, w.Body.String(), "event: complete")
+				for line := range strings.SplitSeq(w.Body.String(), "\n") {
+					if data, ok := strings.CutPrefix(line, "data: "); ok {
+						var accepted struct {
+							InvocationID string `json:"invocation_id"`
+						}
+						require.NoError(t, common.UnmarshalJsonStr(data, &accepted))
+						if accepted.InvocationID != "" {
+							invocationID = accepted.InvocationID
+							break
+						}
+					}
+				}
+			}
+			assert.EqualValues(t, 2, toolCalls.Load(), "replay does not execute or charge twice")
+			var streamed model.MCPInvocation
+			require.NoError(t, model.DB.Where("id = ?", invocationID).First(&streamed).Error)
+			assert.Equal(t, "settled", streamed.BillingStatus)
+			final := request("GET", "/api/mcp/self/test-invocations/"+streamed.ID, "user", "", "", "")
+			require.Equal(t, 200, final.Code)
+			assert.Contains(t, final.Body.String(), "tool says hello")
+			assert.NotEqual(t, 200, request("GET", "/api/mcp/self/test-invocations/"+streamed.ID, "admin", "", "", "").Code)
+		})
+
 		require.Equal(t, 200, request("DELETE", "/api/mcp/self/installations/"+installed.Data.ID+"/authorization", "user", "", "", "1").Code)
 		require.Equal(t, 403, request("GET", "/api/mcp/self/servers/"+server.ID+"/test-tools", "user", "", "", "").Code)
 		require.Equal(t, 200, request("DELETE", "/api/mcp/self/installations/"+installed.Data.ID, "user", "", "", "1").Code)

@@ -89,7 +89,10 @@ export function ToolPanel({
     onError: async (error) => {
       const code = (error as { response?: { data?: { code?: string } } })
         .response?.data?.code
-      if (code === 'REAUTHORIZATION_REQUIRED') {
+      if (
+        code === 'REAUTHORIZATION_REQUIRED' ||
+        code === 'ENGINE_AUTHORIZATION_REQUIRED'
+      ) {
         try {
           const result = await mcpRequest<{ authorization_url: string }>(
             `/servers/${server.id}/discovery-authorization`,

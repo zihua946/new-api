@@ -65,7 +65,7 @@ func CreateServer(input ServerInput) (*model.MCPServer, error) {
 		input.Slug = "mcp-" + uuid.NewString()
 		input.Kind = "remote_mcp"
 		if kind := LocalProvider(input.Connection.URL); kind != "" {
-			input.Slug, input.Kind = "provider-"+kind, kind
+			input.Slug, input.Kind = LocalProviderSlug(input.Connection.URL), kind
 
 		}
 	}
@@ -81,13 +81,18 @@ func CreateServer(input ServerInput) (*model.MCPServer, error) {
 	if input.Connection.PackageDigest != "" {
 		return nil, Failure(422, "INVALID_PACKAGE", "Install the configured package to resolve its digest")
 	}
-	if catalog && (input.Connection.Owner != "" || input.Connection.KBID != "") {
-		server.Kind = "public_knowledge"
-		server.AuthMode = "engine_app"
-		if server.Connection.URL != "" {
-			return nil, Failure(422, "INVALID_PROVIDER", "The public library endpoint is assigned by the gateway")
+	if catalog && server.Kind == "public_knowledge" {
+		binding, _ := publicLibraryConnection(input.Connection.URL)
+		if input.Connection.Owner != "" && input.Connection.Owner != binding.Owner || input.Connection.KBID != "" && input.Connection.KBID != binding.KBID {
+			return nil, Failure(422, "INVALID_LIBRARY", "The library must match the MCP URL")
 		}
-		server.Connection.URL = PublicBaseURL() + "/mcp/providers/knowledge/" + server.ID
+		server.AuthMode = "engine_app"
+		server.Connection.Owner, server.Connection.KBID = binding.Owner, binding.KBID
+	} else if catalog && (input.Connection.Owner != "" || input.Connection.KBID != "") {
+		return nil, Failure(422, "INVALID_LIBRARY", "Configure the public library using its MCP URL")
+	}
+	if catalog && server.Kind == "remote_mcp" && PublicBaseURL() != "" && strings.HasPrefix(server.Connection.URL, PublicBaseURL()+"/mcp/providers/knowledge/") {
+		return nil, Failure(422, "INVALID_LIBRARY", "Use a public library MCP URL containing its owner and knowledge base ID")
 	}
 	if err := NormalizeServer(server); err != nil {
 		return nil, err
@@ -192,7 +197,7 @@ func NormalizeServer(server *model.MCPServer) error {
 	if server.Catalog {
 		if server.Kind == "public_knowledge" {
 			c := server.Connection
-			if server.AuthMode != "engine_app" || c.Transport != "streamable_http" || !libraryIdentifier(c.Owner) || !libraryIdentifier(c.KBID) || c.URL != PublicBaseURL()+"/mcp/providers/knowledge/"+server.ID || c.Command != "" || c.Package != "" || c.ClientID != "" || c.EngineBaseURL != "" || c.Scopes != "" {
+			if server.AuthMode != "engine_app" || c.Transport != "streamable_http" || !libraryIdentifier(c.Owner) || !libraryIdentifier(c.KBID) || c.URL != PublicLibraryURL(c.Owner, c.KBID) || c.Command != "" || c.Package != "" || c.ClientID != "" || c.EngineBaseURL != "" || c.Scopes != "" {
 				return Failure(422, "INVALID_LIBRARY", "A public library requires a fixed owner and library ID")
 			}
 			server.Connection = model.MCPConnection{URL: c.URL, Transport: c.Transport, Owner: c.Owner, KBID: c.KBID}
@@ -309,7 +314,11 @@ func PatchServer(id string, patch ServerPatch, sensitive bool) (*model.MCPServer
 		server.AuthMode = *patch.AuthMode
 	}
 	if patch.Connection != nil {
-		if server.Kind == "public_knowledge" && (patch.Connection.Owner != oldConnection.Owner || patch.Connection.KBID != oldConnection.KBID) {
+		if server.Kind == "public_knowledge" && patch.Connection.Owner == "" && patch.Connection.KBID == "" {
+			// URL-only forms retain the immutable library binding.
+			patch.Connection.Owner, patch.Connection.KBID = oldConnection.Owner, oldConnection.KBID
+		}
+		if server.Kind == "public_knowledge" && (patch.Connection.Owner != oldConnection.Owner || patch.Connection.KBID != oldConnection.KBID || patch.Connection.URL != oldConnection.URL) {
 			return nil, Failure(422, "IMMUTABLE_LIBRARY", "Create a new instance to change the library")
 		}
 		provider := LocalProvider(patch.Connection.URL)
@@ -402,11 +411,8 @@ func SetServerStatusForUser(ctx context.Context, id string, revision int64, enab
 		if server.Catalog && server.MetadataRevision > 0 && (server.Icon == "" || strings.TrimSpace(string(server.Readme)) == "") {
 			return nil, Failure(422, "DISPLAY_REQUIRED", "Add an icon and README before publishing")
 		}
-		if server.Kind == "public_knowledge" {
-			if _, err = publicLibraryClient(ctx, server, &Actor{UserID: userID, Draft: true}); err != nil {
-				return nil, err
-			}
-		}
+		// Publishing is an administrative catalog operation, not a business call.
+		// Public-library access is checked with the invoking user's grant at runtime.
 		if server.Connection.Transport == "stdio" && server.Connection.PackageDigest == "" {
 			return nil, Failure(422, "PACKAGE_REQUIRED", "Install the configured package before publishing")
 		}
@@ -521,7 +527,22 @@ func LocalProvider(endpoint string) string {
 	if strings.TrimSpace(endpoint) == base+"/mcp/providers/deepseek" {
 		return "deepseek"
 	}
+	if _, ok := publicLibraryConnection(strings.TrimSpace(endpoint)); ok {
+		return "public_knowledge"
+	}
 	return ""
+}
+
+// LocalProviderSlug gives each built-in endpoint a unique catalog registration.
+func LocalProviderSlug(endpoint string) string {
+	kind := LocalProvider(endpoint)
+	if kind == "public_knowledge" {
+		return "provider-knowledge-" + Digest(strings.TrimSpace(endpoint))[:40]
+	}
+	if kind == "" {
+		return ""
+	}
+	return "provider-" + kind
 }
 
 func updateCatalogConnection(id string, revision int64, updates map[string]any) (*model.MCPServer, error) {

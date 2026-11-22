@@ -23,7 +23,9 @@ type Outcome struct {
 	Billable bool
 	Unknown  bool
 }
-type Progress func(message string)
+
+// Details are optional, namespaced application metadata on a standard MCP progress notification.
+type Progress func(message string, details ...map[string]any) error
 
 func StructuredResult(value any) (*mcpsdk.CallToolResult, error) {
 	encoded, err := common.Marshal(value)

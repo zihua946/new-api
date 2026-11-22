@@ -122,6 +122,8 @@ func DiscoverTools(ctx context.Context, serverID string, userID int) (map[string
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(server.Limits.TimeoutSeconds)*time.Second)
 	defer cancel()
+	// Native tool schemas are local metadata. Discovering them does not grant
+	// access to knowledge content; execution validates the caller's OAuth grant.
 	tools := BuiltinTools(server.Kind)
 	if server.Kind == "remote_mcp" {
 		token, err := discoveryToken(ctx, server, userID)

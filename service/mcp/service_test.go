@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"maps"
 	"math/big"
 	"net/http"
@@ -41,10 +42,15 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 	active.Store(true)
 	var issuer string
 	introspectionPatch := map[string]any{}
+	var exchangeLibraryCode http.HandlerFunc
 	resource := "https://gateway.test/mcp/knowledge"
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var response any
 		switch r.URL.Path {
+		case "/token":
+			require.NotNil(t, exchangeLibraryCode)
+			exchangeLibraryCode(w, r)
+			return
 		case "/.well-known/openid-configuration":
 			response = map[string]any{"issuer": issuer, "authorization_endpoint": issuer + "/authorize", "token_endpoint": issuer + "/token", "jwks_uri": issuer + "/keys", "id_token_signing_alg_values_supported": []string{"RS256"}}
 		case "/keys":
@@ -67,7 +73,7 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 				http.Error(w, "invalid token", 401)
 				return
 			}
-			status := map[string]any{"active": active.Load(), "iss": issuer, "aud": claims["aud"], "sub": claims["sub"], "client_id": claims["azp"], "exp": claims["exp"], "scope": claims["scope"]}
+			status := map[string]any{"client_dynamic_mcp": true, "client_organization": "knowyet", "active": active.Load(), "iss": issuer, "aud": claims["aud"], "sub": claims["sub"], "client_id": claims["azp"], "exp": claims["exp"], "scope": claims["scope"]}
 			maps.Copy(status, introspectionPatch)
 			response = status
 		default:
@@ -151,6 +157,59 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 			active.Store(true)
 		})
 	}
+
+	t.Run("public knowledge admits live dynamic registrations without a client allowlist", func(t *testing.T) {
+		t.Setenv("MCP_OAUTH_ALLOWED_CLIENT_IDS", "")
+		knowledge := &model.MCPServer{Kind: "public_knowledge", Catalog: true, Connection: model.MCPConnection{URL: resource}}
+		for _, tc := range []struct {
+			name         string
+			claims       jwt.MapClaims
+			registration map[string]any
+			wantCode     string
+			callable     bool
+		}{
+			{"dynamic client", nil, nil, "", true},
+			{"read only", jwt.MapClaims{"scope": "mcp:tools:read"}, nil, "", false},
+			{"missing registration", nil, map[string]any{"client_dynamic_mcp": nil}, "CLIENT_NOT_ALLOWED", false},
+			{"disabled or static registration", nil, map[string]any{"client_dynamic_mcp": false}, "CLIENT_NOT_ALLOWED", false},
+			{"other client organization", nil, map[string]any{"client_organization": "other"}, "CLIENT_NOT_ALLOWED", false},
+			{"missing client organization", nil, map[string]any{"client_organization": ""}, "CLIENT_NOT_ALLOWED", false},
+			{"revoked", nil, map[string]any{"active": false}, "AUTHORIZATION_REVOKED", false},
+			{"client mismatch", nil, map[string]any{"client_id": "other"}, "AUTHORIZATION_REVOKED", false},
+			{"expired introspection", nil, map[string]any{"exp": 1}, "AUTHORIZATION_REVOKED", false},
+			{"introspection scope removed", nil, map[string]any{"scope": "openid"}, "AUTHORIZATION_REVOKED", false},
+			{"wrong audience", jwt.MapClaims{"aud": []string{"other"}}, nil, "UNAUTHORIZED", false},
+			{"wrong issuer", jwt.MapClaims{"iss": "https://other.test"}, nil, "UNAUTHORIZED", false},
+			{"expired token", jwt.MapClaims{"exp": 1}, nil, "UNAUTHORIZED", false},
+			{"wrong user organization", jwt.MapClaims{"owner": "built-in"}, nil, "ORGANIZATION_NOT_ALLOWED", false},
+			{"missing scope", jwt.MapClaims{"scope": "openid"}, nil, "INSUFFICIENT_SCOPE", false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				introspectionPatch = map[string]any{"client_dynamic_mcp": true, "client_organization": "knowyet"}
+				maps.Copy(introspectionPatch, tc.registration)
+				claims := maps.Clone(base)
+				claims["azp"] = "new-dynamically-registered-client"
+				maps.Copy(claims, tc.claims)
+				token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+				token.Header["kid"] = "test-key"
+				raw, err := token.SignedString(key)
+				require.NoError(t, err)
+				actor, err := AuthenticateOAuth(t.Context(), knowledge, raw)
+				if tc.wantCode != "" {
+					require.Error(t, err)
+					assert.Equal(t, tc.wantCode, ErrorResponse(err).Code)
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, 100, actor.UserID)
+				assert.Equal(t, tc.callable, actor.CanCall)
+			})
+		}
+		introspectionPatch = map[string]any{}
+		_, err := AuthenticateOAuth(t.Context(), knowledge, forgedToken)
+		require.Error(t, err)
+		assert.Equal(t, "UNAUTHORIZED", ErrorResponse(err).Code)
+	})
 	t.Run("public library creation and personal result use the trusted application", func(t *testing.T) {
 		ctx := t.Context()
 		var public atomic.Bool
@@ -190,15 +249,15 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 				assert.Contains(t, []any{"stable-alice", "stable-bob"}, grantClaims["sub"])
 				assert.Contains(t, strings.Fields(fmt.Sprint(grantClaims["scope"])), "system.login")
 				fmt.Fprintf(w, `{"token_type":"bearer","access_token":"engine-user-%d","expires_in":3540}`, n)
-			case "/v1/knowledge/kb/manual":
+			case "/v1/knowledge/kb/manual", "/v1/knowledge/kb/second-manual":
 				assert.Equal(t, "library-owner", r.URL.Query().Get("owner"))
 				assert.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Bearer engine-user-"))
 				if rejectBusiness.Load() {
 					http.Error(w, "invalid session", 401)
 					return
 				}
-				fmt.Fprintf(w, `{"id":"manual","owner":"library-owner","public_read":%t}`, public.Load())
-			case "/v1/knowledge/kb/manual/chat":
+				fmt.Fprintf(w, `{"id":%q,"owner":"library-owner","public_read":%t}`, strings.TrimPrefix(r.URL.Path, "/v1/knowledge/kb/"), public.Load())
+			case "/v1/knowledge/kb/manual/chat", "/v1/knowledge/kb/second-manual/chat":
 				assert.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Bearer engine-user-"))
 				if rejectBusiness.Load() {
 					http.Error(w, "invalid session", 401)
@@ -208,8 +267,12 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 				assert.Equal(t, "library-owner", r.URL.Query().Get("owner"))
 				assert.NotEmpty(t, r.Header.Get("Idempotency-Key"))
 				chats.Add(1)
+				if r.URL.Path == "/v1/knowledge/kb/second-manual/chat" {
+					fmt.Fprint(w, `{"task_id":"task-two","session_id":"session-two"}`)
+					return
+				}
 				fmt.Fprint(w, `{"task_id":"task-one","session_id":"session-one"}`)
-			case "/v1/tasks/task-one/stream":
+			case "/v1/tasks/task-one/stream", "/v1/tasks/task-two/stream":
 				assert.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Bearer engine-user-"))
 				if rejectBusiness.Load() {
 					http.Error(w, "invalid session", 401)
@@ -217,7 +280,8 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 				}
 				streams.Add(1)
 				w.Header().Set("Content-Type", "text/event-stream")
-				fmt.Fprint(w, `data: {"type":"connected","task_id":"task-one","status":"running"}
+				taskID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/stream")
+				fmt.Fprintf(w, `data: {"type":"connected","task_id":%q,"status":"running"}
 
 data: {"type":"context","messages":["private"]}
 
@@ -226,7 +290,7 @@ data: "content":"answer"}
 
 data: {"type":"completed"}
 
-`)
+`, taskID)
 			default:
 				t.Errorf("unexpected engine path %s", r.URL.Path)
 				http.NotFound(w, r)
@@ -239,9 +303,15 @@ data: {"type":"completed"}
 		t.Setenv("MCP_KNOWLEDGE_OAUTH_CLIENT_SECRET", "casdoor-secret")
 		t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", issuer+","+engine.URL)
 		var config ServerInput
-		require.NoError(t, common.UnmarshalJsonStr(`{"name":"Manual","icon":"OpenAI","readme":"Library guide","connection":{"transport":"streamable_http","owner":"library-owner","kb_id":"manual"}}`, &config))
+		require.NoError(t, common.UnmarshalJsonStr(`{"name":"Manual","icon":"OpenAI","readme":"Library guide","connection":{"transport":"streamable_http","url":"https://gateway.test/mcp/providers/knowledge/library-owner/manual"}}`, &config))
 		server, err := CreateServer(config)
 		require.NoError(t, err)
+		require.NoError(t, model.DB.Create(&model.User{Id: 102, Username: "library-root", AffCode: "libroot", Role: common.RoleRootUser, Status: common.UserStatusEnabled}).Error)
+		_, err = DiscoverTools(ctx, server.ID, 102)
+		require.NoError(t, err, "root can discover built-in tools without a Casdoor identity or personal grant")
+		_, err = publicLibraryClient(ctx, server, &Actor{UserID: 102, Draft: true})
+		require.Error(t, err, "administrative discovery must not authorize business calls")
+		assert.Equal(t, "ENGINE_AUTHORIZATION_REQUIRED", ErrorResponse(err).Code)
 		appClaims := maps.Clone(base)
 		appClaims["aud"] = "business"
 		appClaims["azp"] = "business"
@@ -254,16 +324,69 @@ data: {"type":"completed"}
 			return value
 		}
 		appToken = sign(appClaims)
-		require.NoError(t, storeEngineGrant(ctx, 100, oauth2.Token{AccessToken: appToken, Expiry: time.Now().Add(time.Hour)}))
+		t.Run("library URL installation uses OAuth with single-use browser-bound state", func(t *testing.T) {
+			row, err := Install(server.ID, 100, true)
+			require.NoError(t, err)
+			target, err := BeginAuthorization(ctx, row, "library-browser")
+			require.NoError(t, err)
+			authorize, err := url.Parse(target)
+			require.NoError(t, err)
+			query := authorize.Query()
+			assert.Equal(t, "business", query.Get("client_id"))
+			assert.Equal(t, "S256", query.Get("code_challenge_method"))
+			require.NotEmpty(t, query.Get("nonce"))
+			exchangeLibraryCode = func(w http.ResponseWriter, r *http.Request) {
+				require.NoError(t, r.ParseForm())
+				assert.Equal(t, "library-code", r.Form.Get("code"))
+				assert.Equal(t, query.Get("code_challenge"), oauth2.S256ChallengeFromVerifier(r.Form.Get("code_verifier")))
+				id, secret, ok := r.BasicAuth()
+				assert.True(t, ok)
+				assert.Equal(t, "business", id)
+				assert.Equal(t, "casdoor-secret", secret)
+				idClaims := maps.Clone(appClaims)
+				idClaims["nonce"] = query.Get("nonce")
+				body, err := common.Marshal(map[string]any{"access_token": appToken, "id_token": sign(idClaims), "token_type": "Bearer", "expires_in": 3600})
+				require.NoError(t, err)
+				w.Header().Set("Content-Type", "application/json")
+				_, err = w.Write(body)
+				assert.NoError(t, err)
+			}
+			state := query.Get("state")
+			for _, caller := range []struct {
+				user    int
+				session string
+			}{{101, "library-browser"}, {100, "different-browser"}} {
+				_, err = FinishAuthorization(ctx, caller.user, caller.session, state, "library-code", issuer)
+				require.Error(t, err)
+				assert.Equal(t, "INVALID_AUTHORIZATION_STATE", ErrorResponse(err).Code)
+			}
+			admin, err := FinishAuthorization(ctx, 100, "library-browser", state, "library-code", issuer)
+			require.NoError(t, err)
+			assert.True(t, admin)
+			_, err = FinishAuthorization(ctx, 100, "library-browser", state, "library-code", issuer)
+			require.Error(t, err, "callback replay must fail")
+			installed, err := FindInstallation(server.ID, 100, true)
+			require.NoError(t, err)
+			assert.True(t, installed.Authorized)
+			target, err = BeginAuthorization(ctx, installed, "library-browser")
+			require.NoError(t, err)
+			expired, err := url.Parse(target)
+			require.NoError(t, err)
+			expiredState := expired.Query().Get("state")
+			require.NoError(t, model.DB.Model(&model.MCPAuthorizationFlow{}).Where("id = ?", Digest(expiredState)).Update("expires_at", time.Now().Add(-time.Minute)).Error)
+			_, err = FinishAuthorization(ctx, 100, "library-browser", expiredState, "library-code", issuer)
+			require.Error(t, err)
+			assert.Equal(t, "INVALID_AUTHORIZATION_STATE", ErrorResponse(err).Code)
+		})
 		other := maps.Clone(appClaims)
 		other["sub"] = "stable-bob"
 		require.Error(t, storeEngineGrant(ctx, 100, oauth2.Token{AccessToken: sign(other)}))
 		other = maps.Clone(appClaims)
 		other["aud"] = ResourceURL(server)
 		require.Error(t, storeEngineGrant(ctx, 100, oauth2.Token{AccessToken: sign(other)}))
-		discovered, err := DiscoverTools(ctx, server.ID, 100)
+		discovered, err := DiscoverTools(ctx, server.ID, 102)
 		require.NoError(t, err)
-		require.NoError(t, SyncTools(server.ID, discovered["discovery_id"].(string), 100, server.Revision))
+		require.NoError(t, SyncTools(server.ID, discovered["discovery_id"].(string), 102, server.Revision))
 		tools, err := ListTools(server.ID)
 		require.NoError(t, err)
 		require.Len(t, tools, 2)
@@ -271,10 +394,12 @@ data: {"type":"completed"}
 		for _, tool := range tools {
 			require.NoError(t, PatchTool(server.ID, tool.ID, ToolPatch{Enabled: &on, ExpectedRevision: tool.Revision}, true))
 		}
-		server, err = SetServerStatusForUser(ctx, server.ID, server.Revision+1, true, 100)
+		server, err = SetServerStatusForUser(ctx, server.ID, server.Revision+1, true, 102)
 		require.NoError(t, err)
 		t.Run("disconnect isolates personal knowledge installations", func(t *testing.T) {
-			second, err := CreateServer(config)
+			secondConfig := config
+			secondConfig.Connection.URL = PublicLibraryURL("library-owner", "second-manual")
+			second, err := CreateServer(secondConfig)
 			require.NoError(t, err)
 			require.NoError(t, model.DB.Model(second).Update("enabled", true).Error)
 			second.Enabled = true
@@ -301,19 +426,30 @@ data: {"type":"completed"}
 			assert.True(t, shared)
 		})
 		actor := &Actor{UserID: 100, Group: "default", CanCall: true}
-		args := map[string]any{"request_id": "one", "question": "How?"}
-		for _, key := range []string{"owner", "kb_id", "knowledge_base"} {
+		args := map[string]any{"question": "How?"}
+		for _, key := range []string{"owner", "kb_id", "knowledge_base", "request_id"} {
 			bad := maps.Clone(args)
 			bad[key] = "different"
 			_, err = PrepareCall(server.ID, "create_consultation", actor, bad, InvocationOptions{})
 			require.Error(t, err)
 		}
 		for range 2 {
-			call, err := PrepareCall(server.ID, "create_consultation", actor, args, InvocationOptions{})
+			call, err := PrepareCall(server.ID, "create_consultation", actor, args, InvocationOptions{IdempotencyKey: "one"})
 			require.NoError(t, err)
 			_, err = call.Run(ctx, nil)
 			require.NoError(t, err)
 		}
+		assert.NotContains(t, args, "request_id", "internal IDs must not mutate caller arguments")
+		t.Run("new consultations need no caller request ID", func(t *testing.T) {
+			first, err := PrepareCall(server.ID, "create_consultation", actor, args, InvocationOptions{})
+			require.NoError(t, err)
+			second, err := PrepareCall(server.ID, "create_consultation", actor, args, InvocationOptions{})
+			require.NoError(t, err)
+			assert.True(t, first.Created)
+			assert.True(t, second.Created)
+			assert.NotEqual(t, first.Invocation.ID, second.Invocation.ID)
+			assert.NotEqual(t, first.Invocation.IdempotencyHash, second.Invocation.IdempotencyHash)
+		})
 		assert.EqualValues(t, 1, chats.Load())
 		call, err := PrepareCall(server.ID, "get_consultation_result", actor, map[string]any{"task_id": "task-one"}, InvocationOptions{})
 		require.NoError(t, err)
@@ -322,8 +458,29 @@ data: {"type":"completed"}
 		assert.Contains(t, fmt.Sprint(result.StructuredContent), "answer")
 		assert.NotContains(t, fmt.Sprint(result.StructuredContent), "private")
 		require.EqualValues(t, 1, streams.Load())
+		t.Run("library resources and consultation results are isolated", func(t *testing.T) {
+			second, err := model.GetMCPServerBySlug(LocalProviderSlug(PublicLibraryURL("library-owner", "second-manual")))
+			require.NoError(t, err)
+			_, err = executePublicLibrary(ctx, second, &model.MCPTool{Name: "get_consultation_result"}, actor, map[string]any{"task_id": "task-one"}, nil)
+			require.Error(t, err)
+			_, err = executePublicLibrary(ctx, server, &model.MCPTool{Name: "get_consultation_result"}, &Actor{UserID: 101, CanCall: true}, map[string]any{"task_id": "task-one"}, nil)
+			require.Error(t, err)
+			assert.EqualValues(t, 1, streams.Load(), "cross-library and cross-user reads never reach the engine")
+			previous := resource
+			resource = ResourceURL(server)
+			defer func() { resource = previous }()
+			claims := maps.Clone(base)
+			claims["aud"] = resource
+			token := sign(claims)
+			_, err = AuthenticateOAuth(ctx, server, token)
+			require.NoError(t, err)
+			_, err = AuthenticateOAuth(ctx, second, token)
+			require.Error(t, err, "a token for library one cannot authorize library two")
+		})
 		assert.EqualValues(t, 1, exchanges.Load(), "discovery, execution, replay and result checks reuse the engine JWT")
 		public.Store(false)
+		_, err = DiscoverTools(ctx, server.ID, 100)
+		require.NoError(t, err, "schema discovery does not read library content")
 		_, err = AuthorizedInvocationResult(ctx, call.Invocation, actor, false)
 		require.Error(t, err)
 		assert.EqualValues(t, 1, streams.Load())
@@ -502,6 +659,8 @@ data: {"type":"completed"}
 		assert.True(t, shortClient.expires.Equal(shortExpiry), "engine credentials never outlive the source grant")
 		before = exchanges.Load()
 		require.NoError(t, model.DB.Where("id = ?", engineGrantID(100)).Delete(&model.MCPEngineGrant{}).Error)
+		_, err = DiscoverTools(ctx, server.ID, 100)
+		require.NoError(t, err, "grant revocation does not prevent administrative schema discovery")
 		_, err = publicLibraryClient(ctx, server, actor)
 		require.Error(t, err)
 		assert.Equal(t, before, exchanges.Load(), "removed local grants cannot use cached credentials")
@@ -515,6 +674,77 @@ data: {"type":"completed"}
 			require.NoError(t, err)
 		}
 		assert.Equal(t, before+2, exchanges.Load())
+		t.Run("a second registered library creates and reads its own consultation", func(t *testing.T) {
+			second, err := model.GetMCPServerBySlug(LocalProviderSlug(PublicLibraryURL("library-owner", "second-manual")))
+			require.NoError(t, err)
+			created, err := ExecuteAdapter(ctx, second, &model.MCPTool{Name: "create_consultation"}, actor, map[string]any{"question": "Second library?"}, "", nil)
+			require.NoError(t, err)
+			assert.Contains(t, fmt.Sprint(created.Result.StructuredContent), "task-two")
+			result, err := ExecuteAdapter(ctx, second, &model.MCPTool{Name: "get_consultation_result"}, actor, map[string]any{"task_id": "task-two"}, "", nil)
+			require.NoError(t, err)
+			assert.Contains(t, fmt.Sprint(result.Result.StructuredContent), "answer")
+			_, err = ExecuteAdapter(ctx, server, &model.MCPTool{Name: "get_consultation_result"}, actor, map[string]any{"task_id": "task-two"}, "", nil)
+			require.Error(t, err)
+			assert.EqualValues(t, 2, chats.Load())
+			assert.EqualValues(t, 2, streams.Load())
+		})
+		t.Run("consultation MCP SSE notifications and final result", func(t *testing.T) {
+			var tool model.MCPTool
+			require.NoError(t, model.DB.Where("server_id = ? AND name = ?", server.ID, "get_consultation_result").First(&tool).Error)
+			request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"get_consultation_result","arguments":{"task_id":"task-one"},"_meta":{"progressToken":"stream-42"}}}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Accept", "application/json, text/event-stream")
+			request.Header.Set("MCP-Protocol-Version", "2025-11-25")
+			recorder := httptest.NewRecorder()
+			require.NoError(t, serveProtocolTools(recorder, request, []protocolTool{{server: server, actor: actor, tool: tool, name: tool.Name}}))
+			require.Equal(t, http.StatusOK, recorder.Code)
+			assert.Contains(t, recorder.Header().Get("Content-Type"), "text/event-stream")
+			var notifications []map[string]any
+			var final map[string]any
+			for line := range strings.SplitSeq(recorder.Body.String(), "\n") {
+				data, ok := strings.CutPrefix(line, "data:")
+				if !ok || strings.TrimSpace(data) == "" {
+					continue
+				}
+				var message map[string]any
+				require.NoError(t, common.UnmarshalJsonStr(strings.TrimSpace(data), &message))
+				if message["method"] == "notifications/progress" {
+					require.Nil(t, final, "notifications precede the final response")
+					params := message["params"].(map[string]any)
+					assert.Equal(t, "stream-42", params["progressToken"])
+					assert.Equal(t, float64(len(notifications)+1), params["progress"])
+					notifications = append(notifications, params["_meta"].(map[string]any)["knowyet.com/consultation"].(map[string]any))
+				} else if message["id"] == float64(42) {
+					require.Nil(t, final, "exactly one final response")
+					final = message["result"].(map[string]any)
+				}
+			}
+			require.Len(t, notifications, 3)
+			assert.Equal(t, map[string]any{"task_id": "task-one", "type": "answer_delta", "text": "answer"}, notifications[1])
+			require.NotNil(t, final)
+			answer := final["structuredContent"].(map[string]any)
+			assert.Equal(t, "answer", answer["answer"])
+			assert.Equal(t, true, answer["done"])
+			assert.NotContains(t, recorder.Body.String(), "private")
+
+			// A read is authorized once; revocation affects the next invocation.
+			defer public.Store(true)
+			before := exchanges.Load()
+			var delivered int
+			read, err := executePublicLibrary(ctx, server, &tool, actor, map[string]any{"task_id": "task-one"}, func(_ string, details ...map[string]any) error {
+				delivered++
+				public.Store(false)
+				return nil
+			})
+			require.NoError(t, err)
+			assert.Equal(t, "answer", read.Result.StructuredContent.(map[string]any)["answer"])
+			assert.Equal(t, 3, delivered)
+			assert.Equal(t, before+1, exchanges.Load(), "one entry authorization/exchange, no checks per delta or at completion")
+			_, err = executePublicLibrary(ctx, server, &tool, actor, map[string]any{"task_id": "task-one"}, nil)
+			require.Error(t, err)
+			assert.Equal(t, "RESOURCE_NOT_FOUND", ErrorResponse(err).Code)
+		})
+
 	})
 	t.Run("local provider shares pricing and idempotency with catalog", func(t *testing.T) {
 		t.Setenv("MCP_OAUTH_CLIENT_ID", "")
@@ -1128,7 +1358,75 @@ func TestMCPRetiredKnowledgeProvider(t *testing.T) {
 	assert.Equal(t, "INVALID_PROVIDER", ErrorResponse(err).Code)
 }
 
+func TestMCPPublicLibraryURLRegistration(t *testing.T) {
+	setupMCPService(t)
+	input := ServerInput{Name: "Manual", Connection: model.MCPConnection{URL: PublicLibraryURL("library-owner", "manual"), Transport: "streamable_http"}}
+	server, err := CreateServer(input)
+	require.NoError(t, err)
+	assert.Equal(t, "public_knowledge", server.Kind)
+	assert.Equal(t, "engine_app", server.AuthMode)
+	assert.Equal(t, "library-owner", server.Connection.Owner)
+	assert.Equal(t, "manual", server.Connection.KBID)
+	assert.Equal(t, input.Connection.URL, ResourceURL(server))
+	assert.False(t, server.Enabled, "registration alone never publishes a library")
+	_, err = CreateServer(input)
+	require.Error(t, err)
+	assert.Equal(t, "SLUG_EXISTS", ErrorResponse(err).Code)
+	for _, binding := range [][2]string{{"library-owner", "second-manual"}, {"other-owner", "manual"}} {
+		other := input
+		other.Connection.URL = PublicLibraryURL(binding[0], binding[1])
+		created, err := CreateServer(other)
+		require.NoError(t, err)
+		assert.NotEqual(t, server.ID, created.ID)
+		assert.NotEqual(t, server.Slug, created.Slug)
+		assert.Equal(t, binding[0], created.Connection.Owner)
+		assert.Equal(t, binding[1], created.Connection.KBID)
+	}
+	for _, endpoint := range []string{
+		PublicBaseURL() + "/mcp/providers/knowledge/" + server.ID,
+		PublicLibraryURL("library-owner", "manual") + "?owner=other",
+		PublicLibraryURL("library-owner", "manual") + "/extra",
+		PublicBaseURL() + "/mcp/providers/knowledge/library-owner/%2Fmanual",
+		PublicBaseURL() + "/mcp/providers/knowledge/library-owner/..",
+	} {
+		bad := input
+		bad.Connection.URL = endpoint
+		_, err := CreateServer(bad)
+		require.Error(t, err, endpoint)
+	}
+	for _, connection := range []model.MCPConnection{
+		{Transport: "streamable_http", Owner: "library-owner", KBID: "manual"},
+		{Transport: "streamable_http", URL: input.Connection.URL, Owner: "different-owner"},
+		{Transport: "http_sse", URL: input.Connection.URL},
+		{Transport: "streamable_http", URL: input.Connection.URL, ClientID: "untrusted-client"},
+	} {
+		_, err := CreateServer(ServerInput{Name: "Invalid library", Connection: connection})
+		require.Error(t, err)
+	}
+	name := "Updated manual"
+	updated, err := PatchServer(server.ID, ServerPatch{ExpectedRevision: server.Revision, Name: &name, Connection: &input.Connection}, true)
+	require.NoError(t, err)
+	assert.Equal(t, server.Connection, updated.Connection)
+	assert.Equal(t, server.ConnectionRevision, updated.ConnectionRevision, "metadata editing preserves existing authorizations")
+	changed := model.MCPConnection{Transport: "streamable_http", URL: PublicLibraryURL("library-owner", "second-manual")}
+	_, err = PatchServer(server.ID, ServerPatch{ExpectedRevision: updated.Revision, Connection: &changed}, true)
+	require.Error(t, err)
+	assert.Equal(t, "IMMUTABLE_LIBRARY", ErrorResponse(err).Code)
+}
+
 func TestMCPBuiltinArguments(t *testing.T) {
+	for _, tool := range BuiltinTools("public_knowledge") {
+		if tool.Name != "create_consultation" {
+			continue
+		}
+		props := tool.InputSchema["properties"].(map[string]any)
+		assert.Len(t, props, 2)
+		assert.Contains(t, props, "question")
+		assert.Contains(t, props, "session_id")
+		require.NoError(t, ValidateToolSchema(tool.InputSchema, map[string]any{"question": "How?"}))
+		require.NoError(t, ValidateToolSchema(tool.InputSchema, map[string]any{"question": "How?", "session_id": "session-one"}))
+		require.Error(t, ValidateToolSchema(tool.InputSchema, map[string]any{"question": "How?", "request_id": "external"}))
+	}
 	for _, tc := range []struct {
 		tool      string
 		arguments map[string]any
@@ -1770,4 +2068,89 @@ func TestMCPLocalDynamicClientRegistration(t *testing.T) {
 	assert.Equal(t, "S256", parsed.Query().Get("code_challenge_method"))
 	assert.Equal(t, endpoint, parsed.Query().Get("resource"))
 	assert.EqualValues(t, 2, registrations.Load(), "later authorizations reuse persisted registration")
+}
+
+func TestMCPPublicKnowledgeStreamsBeforeCompletion(t *testing.T) {
+	for _, terminal := range []string{"completed", "error", "truncated", "cancelled"} {
+		t.Run(terminal, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			delivered := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: {\"type\":\"connected\",\"task_id\":\"task-stream\",\"status\":\"running\"}\n\ndata: {\"type\":\"thinking_delta\",\"content\":\"private\"}\n\ndata: {\"type\":\"text_delta\",\"content\":\"hello\"}\n\n")
+				w.(http.Flusher).Flush()
+				// Completion is impossible until the consumer receives the answer delta.
+				select {
+				case <-delivered:
+				case <-r.Context().Done():
+					return
+				}
+				if terminal == "completed" || terminal == "error" {
+					fmt.Fprintf(w, "data: {\"type\":%q}\n\n", terminal)
+				}
+			}))
+			defer upstream.Close()
+			engine := &publicEngine{knowledgeClient: knowledgeClient{server: &model.MCPServer{Connection: model.MCPConnection{EngineBaseURL: upstream.URL}, Limits: model.MCPLimits{TimeoutSeconds: 10}}, client: upstream.Client()}}
+			var events []map[string]any
+			result, err := engine.snapshot(ctx, "task-stream", func(_ string, details ...map[string]any) error {
+				event := details[0]
+				events = append(events, event)
+				if event["type"] == "answer_delta" {
+					close(delivered)
+					if terminal == "cancelled" {
+						cancel()
+						return ctx.Err()
+					}
+				}
+				return nil
+			})
+			require.GreaterOrEqual(t, len(events), 2)
+			assert.Equal(t, map[string]any{"task_id": "task-stream", "type": "answer_delta", "text": "hello"}, events[1])
+			assert.NotContains(t, fmt.Sprint(events), "private")
+			if terminal == "truncated" || terminal == "cancelled" {
+				require.Error(t, err)
+				assert.Nil(t, result)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "hello", result["answer"])
+			assert.Equal(t, true, result["done"])
+			expected := "completed"
+			if terminal == "error" {
+				expected = "failed"
+			}
+			assert.Equal(t, expected, result["status"])
+		})
+	}
+}
+
+func TestToolInvocationHTTPConnectionReuse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, r.RemoteAddr) }))
+	defer upstream.Close()
+	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", upstream.URL)
+	pool := &requestHTTPPool{}
+	defer pool.Close()
+	ctx := context.WithValue(t.Context(), requestHTTPPoolKey{}, pool)
+	var addresses []string
+	for _, path := range []string{"/introspect", "/keys", "/introspect"} {
+		client, err := requestHTTPClient(ctx, upstream.URL+path, time.Second)
+		require.NoError(t, err)
+		response, err := client.Get(upstream.URL + path)
+		require.NoError(t, err)
+		data, err := io.ReadAll(response.Body)
+		require.NoError(t, err)
+		require.NoError(t, response.Body.Close())
+		addresses = append(addresses, string(data))
+		client.CloseIdleConnections()
+	}
+	assert.Equal(t, addresses[0], addresses[1])
+	assert.Equal(t, addresses[0], addresses[2], "individual callers must not tear down invocation-owned connections")
+	client, err := requestHTTPClient(ctx, upstream.URL, time.Second)
+	require.NoError(t, err)
+	_, err = client.Get("https://other.example.com/introspect")
+	require.Error(t, err, "connection reuse must preserve origin pinning")
+	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", "")
+	_, err = requestHTTPClient(ctx, upstream.URL, time.Second)
+	require.Error(t, err, "revoked origin configuration must not reuse a previously allowed transport")
 }

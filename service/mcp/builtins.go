@@ -41,8 +41,9 @@ func builtinDefinitionsFor(kind string) []model.MCPTool {
 			switch tool.Name {
 			case "create_consultation":
 				delete(tool.InputSchema["properties"].(map[string]any), "knowledge_base")
-				tool.InputSchema["required"] = []string{"question", "request_id"}
-				tool.Description = "Ask this public library a question. Reuse request_id when retrying. Model usage is billed separately."
+				delete(tool.InputSchema["properties"].(map[string]any), "request_id")
+				tool.InputSchema["required"] = []string{"question"}
+				tool.Description = "Ask this public library a question. Model usage is billed separately."
 			case "get_consultation_result":
 				props := tool.InputSchema["properties"].(map[string]any)
 				delete(props, "cursor")

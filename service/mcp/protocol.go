@@ -110,6 +110,8 @@ func serveProtocolTools(w http.ResponseWriter, r *http.Request, bindings []proto
 			definition.OutputSchema = tool.OutputSchema
 		}
 		sdk.AddTool(definition, func(ctx context.Context, request *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+			// Notifications need the downstream SDK request context for SSE routing.
+			protocolContext := ctx
 			ctx = mcpExecutionContext{ctx}
 			var arguments map[string]any
 			if len(request.Params.Arguments) != 0 {
@@ -138,9 +140,13 @@ func serveProtocolTools(w http.ResponseWriter, r *http.Request, bindings []proto
 			var progress Progress
 			if token := request.Params.GetProgressToken(); token != nil {
 				var count float64
-				progress = func(message string) {
+				progress = func(message string, details ...map[string]any) error {
 					count++
-					_ = request.Session.NotifyProgress(ctx, &mcpsdk.ProgressNotificationParams{ProgressToken: token, Progress: count, Message: message})
+					params := &mcpsdk.ProgressNotificationParams{ProgressToken: token, Progress: count, Message: message}
+					if len(details) > 0 {
+						params.Meta = mcpsdk.Meta{"knowyet.com/consultation": details[0]}
+					}
+					return request.Session.NotifyProgress(protocolContext, params)
 				}
 			}
 			result, err := prepared.Run(ctx, progress)

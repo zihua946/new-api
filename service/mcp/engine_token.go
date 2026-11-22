@@ -133,7 +133,7 @@ func knowledgeEngineToken(ctx context.Context, userID int, subject, base, client
 
 func verifyKnowledgeGrantActive(ctx context.Context, clientID, secret, subject, raw string) error {
 	issuer := strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")
-	client, err := NewHTTPClient(issuer, 10*time.Second)
+	client, err := requestHTTPClient(ctx, issuer, 10*time.Second)
 	if err != nil {
 		return err
 	}
@@ -168,7 +168,7 @@ func verifyKnowledgeGrantActive(ctx context.Context, clientID, secret, subject, 
 }
 
 func exchangeKnowledgeEngineToken(ctx context.Context, base, clientID, secret string, grant *oauth2.Token, timeout time.Duration) (cachedEngineToken, error) {
-	client, err := NewHTTPClient(base, timeout)
+	client, err := requestHTTPClient(ctx, base, timeout)
 	if err != nil {
 		return cachedEngineToken{}, err
 	}

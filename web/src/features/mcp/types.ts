@@ -16,10 +16,31 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-export type MCPKind =
-  | 'deepseek'
-  | 'public_knowledge'
-  | 'remote_mcp'
+import { z } from 'zod'
+
+const citation = z.object({
+  title: z.string().optional(),
+  url: z.string().optional(),
+  reference: z.string().optional(),
+})
+export const consultationResult = z.object({
+  structuredContent: z.object({
+    answer: z.string(),
+    status: z.string(),
+    done: z.boolean(),
+    citations: z.array(citation),
+  }),
+})
+export const consultationUpdate = citation.extend({
+  task_id: z.string(),
+  type: z.enum(['answer_delta', 'citation', 'status', 'progress']),
+  text: z.string().optional(),
+  status: z.string().optional(),
+})
+export type ConsultationUpdate = z.infer<typeof consultationUpdate>
+export type ConsultationCitation = z.infer<typeof citation>
+
+export type MCPKind = 'deepseek' | 'public_knowledge' | 'remote_mcp'
 export interface MCPServer {
   id: string
   slug: string

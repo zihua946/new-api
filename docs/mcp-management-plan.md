@@ -67,7 +67,7 @@
 
 ## 6. 按公开知识库发布的咨询服务
 
-**服务绑定。** 管理员在 new-api 为每个公开库登记稳定的服务 ID、`owner`、`kb_id`、展示资料和各工具价格。例如同一套代码可提供 `/mcp/providers/knowledge/{server_id}` 的两个实例，各有自己的地址、工具开关、价格和 OAuth resource。known-engine 以 owner 与 kb_id 定位知识库，允许不同 owner 使用同一 kb_id。发布时用准确的库详情验证 `public_read`，调用及重读缓存结果时校验当前公开状态和本人授权。库转私有或被删除时停止通过该实例提供公开服务。改绑知识库创建新实例，旧任务继续归属于原实例。
+**服务绑定。** 管理员在 new-api 的标准 MCP 表单选择 Streamable HTTP，填写完整的 `{MCP_PUBLIC_BASE_URL}/mcp/providers/knowledge/{owner}/{kb_id}` URL、展示资料和各工具价格。后端从规范 URL 提取并持久化固定的 `owner`、`kb_id`，无需表单额外填写，也不接受通过工具参数更换。每个 URL 只能登记一次；不同知识库各有自己的服务记录、地址、工具开关、价格和 OAuth resource。未注册、未启用或未填全 owner/kb_id 的地址不提供 MCP 服务。旧 `/mcp/providers/knowledge/{server_id}` 地址已删除，不再兼容。known-engine 以 owner 与 kb_id 定位知识库，允许不同 owner 使用同一 kb_id。发布时用准确的库详情验证 `public_read`，调用及重读缓存结果时校验当前公开状态和本人授权。库转私有或被删除时停止通过该实例提供公开服务。改绑知识库创建新实例，旧任务继续归属于原实例。
 
 | 发布的工具 | 输入与引擎契约 | 对外结果 |
 | --- | --- | --- |
@@ -78,7 +78,7 @@
 
 ### 复用 known-engine 的 `POST /v1/auth/app-exchange`
 
-将 new-api 的知识库连接登记为 known-engine 的一个受信业务应用。发布更多公开库时，只需在 new-api 登记各自的服务实例。该应用代表实际调用人访问引擎，创建和查询共用本人的引擎连接。[known-engine 现有业务应用接入约定](../../known-engine/docs/architecture/auth/13-unified-upgrade.md)
+将 new-api 的知识库连接登记为 known-engine 的一个受信业务应用。发布更多公开库时，只需在 new-api 登记包含具体 owner 和 kb_id 的完整 MCP URL，无需为每个库新增路由或修改代码。该应用代表实际调用人访问引擎，创建和查询共用本人的引擎连接。[known-engine 现有业务应用接入约定](../../known-engine/docs/architecture/auth/13-unified-upgrade.md)
 
 1. **确认调用人。** 工具测试页从当前平台会话取得用户，API Key 入口校验其所有者，外部 MCP 客户端使用面向该实例资源 URL 的访问令牌。new-api 校验当前实例的调用资格，用已验证的 Casdoor 发行方和用户标识 `(iss, sub)` 将当前账号与引擎连接匹配。[MCP 身份校验](../service/mcp/auth.go)
 2. **取得受信应用的用户授权。** `/app-exchange` 要求输入的 Casdoor access token 以登记应用的 `client_id` 为受众。优先复用同一用户已授予该应用且仍有效的授权。首次缺少授权时，new-api 以登记应用身份发起授权码流程，绑定 state、PKCE S256 和 OIDC nonce，按配置申请业务登录权限（例如 `system.login`）。回调核对签名、发行方、受众及同一 `sub`，按用途加密保存授权。项目的账号绑定只保存身份关系，不能据此推定已有可交换的令牌。Casdoor 可复用浏览器登录态，首次是否出现确认页取决于该应用的授权记录。工具页回到原实例，外部客户端可通过站内连接入口补齐授权。调用者拥有有效的引擎连接后，创建和查询无需分别授权。[new-api 的 SSO 回调](../controller/oauth.go) · [账号绑定](../model/user_oauth_binding.go) · [Casdoor 的令牌受众](../../casdoor/object/token_jwt.go)
@@ -256,3 +256,164 @@ MCP 订阅退款单独在一个事务内更新订阅额度和预扣记录，以�
 - `go test ./model -run '^TestMCP' -count=1 -v`：真实 SQLite 3.50.4、MySQL 8.0.46、PostgreSQL 15.19 分别通过。MySQL 使用 `MCP_TEST_MYSQL_DSN` 指向 `127.0.0.1:23306/mcp_test`；PostgreSQL 使用 `MCP_TEST_POSTGRES_DSN` 指向 `127.0.0.1:25432/mcp_test`，密码由隔离测试环境提供。两者设置 `MCP_TEST_REDIS_ADDR=127.0.0.1:26379`，使用 Redis 7.4.11、DB 14；没有连接生产数据库。日志分别位于 `/tmp/new-api-legacy-quota-sqlite.log`、`/tmp/new-api-legacy-quota-mysql.log`、`/tmp/new-api-legacy-quota-postgres.log`。
 - `go test -race ./model -run '^TestMCP(AndModelConcurrentReservation|ConcurrentDuplicateDoesNotRepeatBalanceMutation|AbandonedBatchCannotCreateRefundCredit|ReservationUsesLegacyBatchQueue)$' -count=1`：通过。
 - 数据库用例包含新建 MCP 表、历史 MCP 字段升级、重复迁移和已有数据保留检查。对配置的 origin、upstream 执行 `git ls-remote --tags` 均没有返回发布标签，尚无可确认的最新发布版基线，因此未完成“最新发布版整库升级 + 完整启动两次”的发布演练，不将上述定向验证等同于发布兼容性验收。此次未改日志库迁移及日志写入实现，也未重新验证 ClickHouse。
+
+## 12. Public Knowledge 按固定知识库 URL 注册（2026-11-22）
+
+后台统一使用 Streamable HTTP 和完整 MCP URL，例如 `https://gateway.example/mcp/providers/knowledge/library-owner/manual` 与 `https://gateway.example/mcp/providers/knowledge/library-owner/second-manual`。域名必须与部署的 `MCP_PUBLIC_BASE_URL` 一致。服务端登记时从 URL 固定绑定 owner/kb_id，后续只能编辑展示资料和运行限制，换库需要新建服务。不存在一个留空 owner/kb_id、由工具调用选择库的通用公开服务。旧实例 ID 路由及对应 metadata 路由已删除，不迁移旧登记记录。
+
+登记后仍需管理员授权、发现并启用工具、配置展示资料并发布；发布检查目标库的 `public_read`。用户安装后通过既有 OAuth 授权流程连接知识应用，有效的本人应用授权可复用，但每个服务的安装资格独立。后端统一使用 `MCP_KNOWLEDGE_ENGINE_URL`、`MCP_KNOWLEDGE_CLIENT_ID` 和 `MCP_KNOWLEDGE_CLIENT_SECRET`，不把交换密钥交给客户端。每个服务仅提供创建咨询和读取本人咨询结果，服务、用户、知识库、会话与任务之间的绑定继续在后端检查。
+
+前端复用现有 `ServerForm`、共享 `Dialog`、`Form`、`Input`、`Select` 和安装授权组件，移除公共知识库专用传输选项及 owner/kb_id 输入框，无新增组件或翻译键。
+
+验证结果：
+
+| 环境 | 命令／范围 | 结果 |
+| --- | --- | --- |
+| SQLite 3.50.4（项目 Go 驱动） | `go test ./service/mcp ./router -count=1` | 通过 |
+| MySQL 8.0.46 | 下列服务注册、OAuth/双库执行、HTTP 合约三个定向用例 | 全部通过 |
+| PostgreSQL 15.19 | 同上 | 全部通过 |
+| Go | `go build ./...` | 通过 |
+| 前端，Node 24.21.0、Bun 1.4.3 | `bun run typecheck`；`bun run test src/features/mcp/__tests__/mcp.test.tsx`；`bun run build` | 通过，38 个测试通过 |
+| 前端静态检查 | `bun x oxlint -c .oxlintrc.json src/features/mcp/server-form.tsx src/features/mcp/__tests__/mcp.test.tsx`；`bun x oxfmt --check src/features/mcp/server-form.tsx` | 无 lint error，表单格式通过；测试文件原有一条 prefer-template warning 及整文件格式差异，未进行无关格式重写 |
+
+MySQL/PostgreSQL 使用专用本地测试库。以下每个定向用例运行前均重建对应测试库；原有测试库已备份并在验证后恢复。没有修改 schema、迁移、驱动或日志库行为。
+
+```sh
+# MySQL；PostgreSQL 时替换为下方 DSN。
+export MCP_SERVICE_TEST_SQL_DSN='root@tcp(127.0.0.1:23306)/mcp_service_test?charset=utf8mb4&parseTime=True&loc=Local'
+# export MCP_SERVICE_TEST_SQL_DSN='postgres://postgres:mcp-local-test@127.0.0.1:25432/mcp_service_test?sslmode=disable'
+go test ./service/mcp -run '^TestMCPPublicLibraryURLRegistration$' -count=1
+go test ./service/mcp -run '^TestMCPOAuthCryptographicAndLiveAuthorization$' -count=1
+export MCP_ROUTER_TEST_SQL_DSN='root@tcp(127.0.0.1:23306)/mcp_router_test?charset=utf8mb4&parseTime=True&loc=Local'
+# export MCP_ROUTER_TEST_SQL_DSN='postgres://postgres:mcp-local-test@127.0.0.1:25432/mcp_router_test?sslmode=disable'
+go test ./router -run '^TestMCPManagementHTTPContract$' -count=1
+```
+
+本轮覆盖完整 URL 登记、同 owner 多库及不同 owner 同名库、重复登记、不可改绑、非法 URL、未注册／未启用／旧地址的 404、未授权请求的 401、OAuth PKCE S256、回调的用户／浏览器会话绑定、过期及重放拒绝、两库各自创建和查询、跨库令牌、跨库／跨用户任务结果隔离、授权撤回和公开库转私有。安全依据为 [OWASP ASVS 5.0.0 OAuth/OIDC](https://github.com/OWASP/ASVS/blob/v5.0.0/5.0/en/0x19-V10-OAuth-and-OIDC.md) 的 10.1.2、10.2.1、10.3.1–10.3.3，以及 [授权控制](https://github.com/OWASP/ASVS/blob/v5.0.0/5.0/en/0x17-V8-Authorization.md) 的 8.2.2、8.3.1；同时参照 [Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)、[Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)、[OAuth2](https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html) 和 [CSRF](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html) 指南。
+
+OAuth 与 known-engine 在本轮集成测试中使用 HTTP 测试服务，数据库为真实实例；没有进行目标运行实例上的浏览器授权或付费模型咨询，也没有重启部署。以上为所列控制的回归证据，不是整个应用的 ASVS 合规声明。前端测试使用 PATH 中的 Node 运行 Vitest；缺少 Node 而回退为 Bun 运行 Vitest 时，既有依赖会在 Zod 导入处失败。
+
+### 发现工具时补齐知识应用授权（2026-11-22）
+
+修正首次 URL 重构遗漏：Public Knowledge 的工具发现曾直接返回内置 schema，未触发知识应用授权，导致发现成功后发布才报 `ENGINE_AUTHORIZATION_REQUIRED`。现在 `DiscoverTools` 使用与发布相同的 `publicLibraryClient` 检查当前管理员的应用授权及目标库公开状态；失败时不生成可同步的 discovery。前端复用已有发现授权入口，针对 `REAUTHORIZATION_REQUIRED` 和 `ENGINE_AUTHORIZATION_REQUIRED` 跳转 OAuth，成功回调后继续发现并自动同步，发布复用同一授权。
+
+先补回归并确认失败（无授权发现竟返回成功、知识应用错误码未触发跳转），再修正后通过：`go test ./service/mcp ./router -count=1`；真实 SQLite 3.50.4、MySQL 8.0.46、PostgreSQL 15.19 的 `TestMCPOAuthCryptographicAndLiveAuthorization`（命令及专用 DSN 同上）；`bun run typecheck`、`bun run test src/features/mcp/__tests__/mcp.test.tsx`（41 个用例）、`bun run build`；涉及文件 lint 无 error，`tool-panel.tsx` 格式检查通过。回归覆盖无授权、撤销授权、库转私有、授权后发现和发布，以及浏览器授权回跳后单次发现／同步。没有修改 OAuth 凭据、scope、PKCE、nonce、回调会话绑定或 token 校验规则；安全依据沿用本节 ASVS 5.0.0 10.1.2、10.2.1、10.3.1–10.3.3、8.2.2、8.3.1 及 OWASP 指南。
+
+修复版已重新构建并部署到本地 `new-api-dev`（`:3000`），前端开发服务（`:5173`）加载新代码，Casdoor 转发容器已重新连接。部署后 API 状态、Casdoor discovery 和 known-engine 连通检查通过。未代替用户授予知识应用权限；原生浏览器验证因用户切换活动窗口而停止，真实账号的 OAuth 确认及最终发布仍由用户操作。
+
+### 直接启用授权入口与本地账号排查（2026-11-22）
+
+管理员直接启用时，如服务返回 `ENGINE_AUTHORIZATION_REQUIRED` 或 `REAUTHORIZATION_REQUIRED`，现在复用工具发现的授权入口；回调继续发现／同步，管理员随后再次确认启用。复用现有 ConfirmDialog 与回调流程，不新增授权页面，不自动放宽服务端身份校验。本轮仅调整前端入口，不改变数据库或 OAuth 协议；安全依据沿用上节 OWASP ASVS 5.0.0 与 OAuth2、Authentication、Session Management 指南。
+
+本地 `Reconnect the trusted knowledge application` 的已确认原因：失败回调的访问令牌 `owner=built-in`，运行配置只信任 `mcp-local`；平台绑定账号为 `mcp-local/test_casdoor`，该账号的回调和发现成功。未修改组织信任边界，未记录原始令牌或授权码。支持其他组织需要同时修改 new-api 与 known-engine 的显式信任配置，并保留平台身份一致性校验，不能通过移除 owner 校验修复账号不一致。
+
+本次验证：新增“直接启用触发授权”用例先失败、修改后通过；MCP 文件共 42 个用例中 41 个通过，既有 `pricing=null` 定价弹窗用例两次均因找不到价格 textbox 失败，未宣称整套测试通过。`bun run typecheck`、涉及文件 oxlint（仅既有 prefer-template warning）及 `bun run build` 通过。前端开发服务加载本次入口修复，未重建无改动的后端。
+
+用户明确要求启用时不要自动 OAuth，已撤回本节的启用自动跳转及对应测试；发现工具入口的授权行为保持原样。上述直接启用跳转仅为已撤回方案的验证记录，不代表当前行为。
+
+### 定价测试隔离修复（2026-11-22）
+
+调用栈确认先前定价失败来自管理页遗留的 `/api/status` 请求：在定价用例设置 TOKENS 后，`fetchStatus` 将全局币种覆盖为本地服务的 CNY，导致 USD 标签断言失败。现于 MCP 测试文件模拟 `getStatus` 固定响应，并在清理时先卸载组件、取消查询，再清缓存、恢复系统配置。没有修改定价产品行为。`bun run test src/features/mcp/__tests__/mcp.test.tsx` 41/41 通过；`bun run typecheck` 通过；该文件 oxlint 无 error，仅既有 prefer-template warning。当前 `:5173` 是 Rsbuild 开发服务，撤回启用自动 OAuth 刷新即可生效，无需重建后端镜像；此次测试隔离改动也不需要部署。
+
+### 管理员发布与用户授权分离（2026-11-22，当前行为）
+
+纠正前述“发现与启用要求管理员个人知识授权”的流程。Public Knowledge 的工具 schema 为本地固定定义：后台发现、同步、审核定价和发布只要求平台管理权限，不再调用 `publicLibraryClient`，所以未绑定 Casdoor 的 root 也可以管理。保留固定 owner/kb_id URL、显示资料、已启用且已定价工具、加密配置和公开 URL 等发布约束。启用不自动跳转 OAuth，也不会给管理员创建个人知识授权。
+
+发布成功仅表示目录配置可用，不代表对目标库完成连通性或公开状态验证。用户安装后的 OAuth、实际测试调用、咨询创建、结果读取仍沿用个人授权校验；每次业务访问及结果交付继续验证库公开状态、当前授权、用户及任务归属。未新增服务账号或管理员代用凭据，未扩大 Casdoor 组织信任范围。前述让管理员先 OAuth 的方案已被本节取代。
+
+回归在既有 `TestMCPOAuthCryptographicAndLiveAuthorization` 中新增无 Casdoor 绑定、无知识授权的 root，验证其发现／同步／启用成功，但访问知识客户端仍被拒绝；授权撤销后管理发现仍可用，实际调用继续失败。先验证旧实现会报 `ENGINE_AUTHORIZATION_REQUIRED`，再移除管理阶段的个人授权依赖。`go test ./service/mcp ./router -count=1` 通过（SQLite 3.50.4）；真实 MySQL 8.0.46 和 PostgreSQL 15.19 上同一 OAuth／实时授权测试通过，执行命令为 `python3 /tmp/public-knowledge-db-matrix.py mysql TestMCPOAuthCryptographicAndLiveAuthorization` 及 postgres 对应命令，DSN 与前文相同。数据库结构与 SQL 未修改。
+
+安全边界沿用 OWASP ASVS 5.0.0 的授权控制 8.2.2、8.3.1 及 OAuth/OIDC 10.1.2、10.2.1、10.3.1–10.3.3，参照前文 Authentication、Session Management、OAuth2 与 CSRF 指南。管理路由保留 AdminAuth、MCP 权限及 CSRF guard；个人 OAuth 的签名、受众、组织、nonce、PKCE、会话绑定、过期与重放校验未放宽，现有相关回归通过。这不构成整个应用的 ASVS 合规声明。
+
+上述后端修复已通过 `docker compose -f docker-compose.dev.yml build new-api` 与 `up -d --no-deps new-api` 部署到本地 `new-api-dev`，并重新建立 Casdoor loopback 转发。运行镜像为 `sha256:a4dd50de10cddd06301207928305259db3bb5ee76e93106ea20bd38a01353ed2`，回退镜像标签为 `new-api-dev:before-admin-publication-20261122`。部署后 `/api/status` 返回 200/success，容器内 Casdoor discovery 与 known-engine OpenAPI 均可达。现有 Public Knowledge 配置保留未启用状态，两个工具已满足审核／启用／定价条件；未代替用户点击发布。
+
+### Public Knowledge SSE consultation updates
+
+`get_consultation_result` accepts the standard MCP request metadata
+`params._meta.progressToken`. With a token, the provider consumes the engine SSE
+stream until completion or the configured invocation/credential deadline, rather
+than using the five-second snapshot window. Without a token, snapshot behavior is
+unchanged. Invocation replay returns the saved final result; it does not replay
+preview notifications.
+
+Intermediate messages are standard `notifications/progress` messages. Their
+`progressToken` correlates the request and `progress` increases monotonically.
+`params._meta["knowyet.com/consultation"]` is an application extension, not a
+standard MCP partial tool result. Its payload includes `task_id` and one of:
+
+- `type: "answer_delta"`, `text`: append this text to the answer preview.
+- `type: "citation"`: allowlisted `title`, `url`, `reference` fields.
+- `type: "status"`, `status`: consultation status.
+- `type: "progress"`, `message`: sanitized execution progress.
+
+The single final JSON-RPC response retains the complete `content` and
+`structuredContent`, including billing metadata. Clients should replace previews
+with that authoritative result, rather than append it. Generic clients may ignore
+the extension and still consume the final result. The web test endpoint supports `Accept: text/event-stream`: an `invocation`
+event supplies the durable invocation ID, `message` events carry the same MCP
+progress envelopes, and `complete` tells the client to finish reading the stream.
+The dashboard consumes this channel for `get_consultation_result`, renders
+sanitized Markdown and citations, and still reads the authorized saved result
+for final content and billing. Disconnection falls back to result polling rather
+than resubmitting the call. Retrying an accepted idempotency key does not replay
+preview events or duplicate execution. Leaving the page closes the browser
+subscription without cancelling the durable invocation.
+
+No raw context, reasoning, or upstream error messages are forwarded. The existing
+live application/library authorization check runs before each preview release,
+and credential/invocation deadlines remain enforced. This applies the server-side
+session expiry and authorization principles in the OWASP
+[Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+and [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html);
+it is not a claim of a full ASVS audit.
+
+Validation: `go test ./service/mcp ./router -count=1` passed. Regression coverage
+includes actual MCP SSE framing/token correlation/final result, delivery before
+upstream completion, private-event filtering, stream truncation, upstream failure,
+cancellation, and revocation before an answer delta is released. No database
+schema, query, or persistence behavior changes are included in this stream change.
+
+Dashboard stream validation: `go test ./router ./service/mcp -count=1` covers
+SSE acceptance/completion, idempotent replay and one-time billing, saved-result
+retrieval and cross-user isolation. The UI reuses `components/ui/markdown.tsx`
+and the existing `sse.js` transport with shared `getFreshAuthHeaders`; the
+playground hook is chat-completion-specific and cannot parse MCP notifications.
+
+Local rollout (2026-11-22): rebuilt and recreated `new-api-dev` with
+`docker compose -f docker-compose.dev.yml build new-api` and
+`docker compose -f docker-compose.dev.yml up -d --no-deps new-api`; recreated its
+Casdoor loopback sidecar against the new container namespace. Restarted the
+Rsbuild frontend on port 5173. Backend health, frontend HTTP response and Casdoor
+discovery succeeded. The previously reported consultation task still returns
+completed with 479 answer characters through its authenticated upstream SSE.
+Frontend validation: 48 tests passed across `mcp.test.tsx` and
+`test-stream.test.ts` under Node 24; `bun run typecheck` and `bun run build` passed.
+Targeted lint has no errors (one pre-existing prefer-template warning).
+The browser loaded the updated local MCP management page; full live browser
+consultation rendering was not verified (the available browser session belongs
+to a different user from the consultation owner). Component/transport tests cover
+incremental rendering, final replacement, disconnect fallback and safe citations.
+
+
+### Public Knowledge 动态 OAuth 客户端准入（2026-11-22）
+
+Public Knowledge 不再使用 `MCP_OAUTH_ALLOWED_CLIENT_IDS` 判断外部客户端。Casdoor 在现有的、需服务端身份认证的令牌内省响应中增加 `client_organization` 和 `client_dynamic_mcp`；后者来自当前应用记录：必须具有动态注册凭据、类型为 MCP、允许 authorization_code 且未禁用登录。注册凭据本身不对外返回。new-api 要求应用组织与受信任组织一致；旧 Casdoor 缺失字段时拒绝访问。其他 MCP 类型保持原准入规则。
+
+保留本地 JWT 签名/issuer/有效期/唯一资源 audience/用户组织/scope 校验，以及每次请求的在线内省、主体和 client_id 一致性、有效期和撤销校验。调用权限仍同时取 JWT 与内省 scope 的交集。`MCP_OAUTH_CLIENT_ID/SECRET` 是资源服务访问内省接口的身份，不能理解成允许调用的客户端名单。
+
+安全参考：OWASP ASVS 5.0.0（v5.0.0-9.1.1、9.1.2、9.1.3、9.2.3、10.3.1、10.3.2、10.3.3）；Authentication、Session Management、OAuth2 Cheat Sheets（https://cheatsheetseries.owasp.org/）。本次检查范围为动态客户端准入及原令牌保护的回归，不代表整个系统已通过 ASVS 审计。
+
+验证：`go test ./service/mcp ./router -count=1`；Casdoor `go test ./object -run 'TestDynamicMCPClientAdmission|TestDiscoveryRegistrationUsesMCPLocalOrganization' -count=1`。覆盖动态客户端无白名单准入、静态/禁用/缺失/跨组织注册拒绝、伪造签名、过期、错误 issuer/audience/用户组织、scope 降级、撤销和内省客户端不一致。无数据库 schema、查询或写入逻辑修改。
+
+本地部署验证：Casdoor 与 new-api 已重建并重启；使用 Qwen 已取得的动态客户端令牌（未添加客户端白名单），`initialize` 返回 200、`notifications/initialized` 返回 202、`tools/list` 返回 200，发现 `create_consultation` 和 `get_consultation_result`。未代用户创建新的计费咨询任务。
+
+
+### 流式调用授权与连接复用（2026-11-22）
+
+`get_consultation_result` 在方法入口完整校验一次用户授权、任务归属与知识库访问权限。同一次调用的增量推送及最终返回不再重复在线校验。调用开始后的撤销/知识库下架在下一次调用时生效；已授权的流受调用超时、取消、调用方令牌及知识应用/引擎凭据有效期限制，不因读取缓冲数据而绕过截止时间。创建咨询保留原有的接受后校验。
+
+本次调用使用按来源、超时与当前可信来源配置隔离的 HTTP 连接池；内部客户端关闭操作不销毁共享连接，调用结束统一关闭空闲连接。连接池不缓存凭据或授权决定，保留来源锁定、SSRF/DNS 地址检查、响应大小限制与跨源重定向限制。本地 Casdoor Nginx 转发使用 HTTP/1.1 上游 keepalive。
+
+安全参考沿用前节 OWASP ASVS 5.0.0 与 Authentication / Session Management / OAuth2 指引。本次明确采用请求级授权语义，不提供流内实时撤销。回归覆盖方法入口只进行一次交换/校验、增量及最终返回不重新授权、撤销后新请求拒绝、取消/过期截止，以及实际 TCP 连接复用和跨源阻断。无数据库行为修改。
+
+验证：`go test ./service/mcp ./router -count=1` 通过，本地重建部署完成。使用 Qwen 现有令牌读取已有咨询，231 条进度通知，最终 done=true、答案 450 字符，约 0.86 秒；该次验证含 HTTP 入口认证共 2 次 Casdoor 内省，全部 200，增量和最终返回不触发在线复核。

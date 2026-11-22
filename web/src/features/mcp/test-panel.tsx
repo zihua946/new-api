@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { ErrorState } from '@/components/error-state'
@@ -37,14 +37,23 @@ import { getServerErrorSources } from '@/lib/server-error-message'
 import { mcpRequest } from './api'
 import { ArgumentFields } from './argument-fields'
 import { useMCPStatusLabels } from './status-labels'
+import { streamMCPTest } from './test-stream'
 import { readArguments, toolParameters } from './tool-parameters'
 import {
+  consultationResult,
+  type ConsultationCitation,
   testPending,
   testRequest,
   type MCPServer,
   type MCPTestResult,
   type MCPTool,
 } from './types'
+
+const Markdown = lazy(() =>
+  import('@/components/ui/markdown').then((module) => ({
+    default: module.Markdown,
+  }))
+)
 
 export function TestPanel({
   server,
@@ -230,6 +239,15 @@ function ToolTest({
   const [invalid, setInvalid] = useState(false)
   const [invocationID, setInvocationID] = useState('')
   const [expanded, setExpanded] = useState(true)
+  const [preview, setPreview] = useState({
+    answer: '',
+    status: '',
+    citations: [] as ConsultationCitation[],
+  })
+  const [interrupted, setInterrupted] = useState(false)
+  const stream = useRef<AbortController | null>(null)
+  const streaming = tool.name === 'get_consultation_result'
+  useEffect(() => () => stream.current?.abort(), [])
   const attempt = useRef<{ body: string; key: string } | null>(null)
   const run = useMutation({
     mutationFn: ({
@@ -238,16 +256,50 @@ function ToolTest({
     }: {
       body: ReturnType<typeof testRequest>
       key: string
-    }) =>
-      mcpRequest<{ invocation_id: string }>(
+    }) => {
+      if (!streaming) {
+        return mcpRequest<{ invocation_id: string; interrupted?: boolean }>(
+          `${serverPath}/test-invocations`,
+          'POST',
+          body,
+          key
+        )
+      }
+      const controller = new AbortController()
+      stream.current?.abort()
+      stream.current = controller
+      return streamMCPTest(
         `${serverPath}/test-invocations`,
-        'POST',
         body,
-        key
-      ),
+        key,
+        controller.signal,
+        (id) => {
+          if (!controller.signal.aborted) setInvocationID(id)
+        },
+        (update) => {
+          if (controller.signal.aborted) return
+          setPreview((previous) => {
+            if (update.type === 'answer_delta') {
+              return {
+                ...previous,
+                answer: previous.answer + (update.text ?? ''),
+              }
+            }
+            if (update.type === 'citation') {
+              return { ...previous, citations: [...previous.citations, update] }
+            }
+            if (update.type === 'status') {
+              return { ...previous, status: update.status ?? previous.status }
+            }
+            return previous
+          })
+        }
+      )
+    },
     onSuccess: (data) => {
       attempt.current = null
       setInvocationID(data.invocation_id)
+      setInterrupted(data.interrupted ?? false)
     },
     onError: (error) => {
       if (
@@ -278,6 +330,8 @@ function ToolTest({
     (!!invocationID && !result.isError && testPending(result.data))
   const error = run.error || result.error
   const invocation = result.data?.invocation
+  const final = consultationResult.safeParse(result.data?.result)
+  const display = final.success ? final.data.structuredContent : preview
   return (
     <form
       className='grid gap-4 py-2'
@@ -296,6 +350,8 @@ function ToolTest({
           }
           setInvalid(false)
           setInvocationID('')
+          setPreview({ answer: '', status: '', citations: [] })
+          setInterrupted(false)
           setExpanded(true)
           run.mutate({ body, key: attempt.current.key })
         } catch {
@@ -333,6 +389,56 @@ function ToolTest({
       >
         {busy ? <Spinner aria-label={t('Running')} /> : t('Execute')}
       </Button>
+      {streaming && !run.isIdle && (
+        <section
+          aria-label={t('Answer')}
+          className='min-w-0 space-y-3 rounded-md border p-3'
+        >
+          <p role='status' className='text-muted-foreground text-sm'>
+            {labels[display.status] ?? (busy ? t('Running') : t('Result'))}
+          </p>
+          {interrupted && busy && (
+            <p role='status'>
+              {t('Live updates disconnected. Waiting for the saved result.')}
+            </p>
+          )}
+          {!!display.answer && (
+            <Suspense fallback={<LoadingState />}>
+              <Markdown>{display.answer}</Markdown>
+            </Suspense>
+          )}
+          {!!display.citations.length && (
+            <div>
+              <p className='font-medium'>{t('References')}</p>
+              <ul className='list-disc space-y-1 pl-5 text-sm'>
+                {[
+                  ...new Map(
+                    display.citations.map((item) => [
+                      JSON.stringify(item),
+                      item,
+                    ])
+                  ).values(),
+                ].map((item) => (
+                  <li key={JSON.stringify(item)}>
+                    {item.url && /^https?:\/\//i.test(item.url) ? (
+                      <a
+                        href={item.url}
+                        target='_blank'
+                        rel='noopener noreferrer'
+                        className='text-primary underline'
+                      >
+                        {item.title || item.reference || item.url}
+                      </a>
+                    ) : (
+                      item.title || item.reference || item.url
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </section>
+      )}
       {!run.isIdle && !busy && (
         <details
           open={expanded}

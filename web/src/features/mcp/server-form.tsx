@@ -60,16 +60,9 @@ const schema = z
     url: z.string(),
     command: z.string().max(4096),
     image: z.string().max(256),
-    owner: z.string().max(256),
-    kb: z.string().max(256),
     icon: z.string(),
     readme: z.string().max(131072),
-    transport: z.enum([
-      'streamable_http',
-      'http_sse',
-      'stdio',
-      'public_knowledge',
-    ]),
+    transport: z.enum(['streamable_http', 'http_sse', 'stdio']),
     client_id: z.string().trim().max(256),
     client_secret: z.string().max(4096),
     timeout: z.number().int().min(1).max(600),
@@ -81,9 +74,6 @@ const schema = z
     if (v.transport === 'stdio') {
       if (!v.image.trim()) bad('image')
       if (!v.command.trim()) bad('command')
-    } else if (v.transport === 'public_knowledge') {
-      if (!v.owner.trim()) bad('owner')
-      if (!v.kb.trim()) bad('kb')
     } else {
       if (!z.url({ protocol: /^https?$/ }).safeParse(v.url).success) bad('url')
     }
@@ -121,12 +111,7 @@ export function ServerForm(props: {
       readme: server?.readme ?? '',
       image: server?.connection.package ?? '',
       command: server?.connection.command ?? '',
-      owner: server?.connection.owner ?? '',
-      kb: server?.connection.kb_id ?? '',
-      transport:
-        server?.kind === 'public_knowledge'
-          ? 'public_knowledge'
-          : remoteTransport,
+      transport: remoteTransport,
       client_id: server?.connection.client_id ?? '',
       client_secret: '',
       timeout: server?.limits.timeout_seconds ?? 60,
@@ -135,7 +120,7 @@ export function ServerForm(props: {
   })
   const transport = useWatch({ control: form.control, name: 'transport' })
   const stdio = transport === 'stdio',
-    library = transport === 'public_knowledge'
+    library = server?.kind === 'public_knowledge'
   const [advanced, setAdvanced] = useState(false)
   const clientID = useWatch({ control: form.control, name: 'client_id' })
   const oauth = !stdio && !library && !!clientID.trim()
@@ -143,7 +128,6 @@ export function ServerForm(props: {
     stdio: 'stdio',
     http_sse: 'SSE',
     streamable_http: 'Streamable HTTP',
-    public_knowledge: t('Public knowledge base'),
   }
   const preview = useMutation({
     mutationFn: () =>
@@ -166,13 +150,6 @@ export function ServerForm(props: {
           transport: 'stdio',
           package: value.image,
           command: value.command,
-        }
-      } else if (library) {
-        connection = {
-          transport: 'streamable_http',
-          owner: value.owner,
-          kb_id: value.kb,
-          url: server?.connection.url,
         }
       } else if (oauth) {
         connection.client_id = value.client_id
@@ -232,17 +209,11 @@ export function ServerForm(props: {
       },
       { name: 'command', label: t('Command'), disabled: !props.sensitive }
     )
-  } else if (library) {
-    const disabled = !!server || !props.sensitive
-    fields.push(
-      { name: 'owner', label: t('Library owner'), disabled },
-      { name: 'kb', label: t('Knowledge base ID'), disabled }
-    )
   } else {
     fields.push({
       name: 'url',
       label: t('Upstream URL'),
-      disabled: !props.sensitive,
+      disabled: !props.sensitive || library,
     })
   }
   return (
@@ -313,11 +284,6 @@ export function ServerForm(props: {
                       </SelectItem>
                       <SelectItem value='http_sse'>SSE</SelectItem>
                       <SelectItem value='stdio'>stdio</SelectItem>
-                      {(!server || library) && (
-                        <SelectItem value='public_knowledge'>
-                          {t('Public knowledge base')}
-                        </SelectItem>
-                      )}
                     </SelectContent>
                   </Select>
                   <FormMessage />

@@ -23,7 +23,7 @@ import {
   createRouter,
   RouterProvider,
 } from "@tanstack/react-router";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -46,17 +46,28 @@ import {
 } from "../types";
 
 const request = vi.hoisted(() => vi.fn());
+const streamRequest = vi.hoisted(() => vi.fn());
+vi.mock("../test-stream", () => ({ streamMCPTest: streamRequest }));
 vi.mock("../api", () => ({ mcpRequest: request }));
+vi.mock("@/lib/api", () => ({
+  getStatus: vi.fn().mockResolvedValue({ mcp_enabled: true, quota_display_type: "USD" }),
+  api: { get: vi.fn(), post: vi.fn(), request: vi.fn() },
+}));
+const initialSystemConfig = useSystemConfigStore.getState().config;
 const clients: QueryClient[] = [];
-afterEach(() => {
+afterEach(async () => {
+  cleanup();
+  await Promise.all(clients.map((client) => client.cancelQueries()));
   for (const client of clients) client.clear();
   clients.length = 0;
   request.mockReset();
+  streamRequest.mockReset();
   sessionStorage.clear();
   window.history.replaceState({}, "", "/");
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   useAuthStore.getState().auth.reset();
+  useSystemConfigStore.getState().setConfig(initialSystemConfig);
 });
 
 function renderMCPTest(authMode = "engine_api_key") {
@@ -405,6 +416,48 @@ describe("MCP marketplace", () => {
 });
 
 describe("MCP authorization return", () => {
+  it.each(["REAUTHORIZATION_REQUIRED", "ENGINE_AUTHORIZATION_REQUIRED"])("starts OAuth when tool discovery returns %s", async (code) => {
+    const authorizationURL = `${window.location.origin}/#knowledge-oauth`;
+    request.mockImplementation(async (path: string) => {
+      if (path.endsWith("/discoveries")) throw { response: { data: { code } } };
+      if (path.endsWith("/discovery-authorization")) return { authorization_url: authorizationURL };
+      return [];
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    clients.push(client);
+    render(<QueryClientProvider client={client}><ToolPanel server={{ id: "library", kind: "public_knowledge" } as MCPServer} sensitive operate write /></QueryClientProvider>);
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Discover tools" }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith("/servers/library/discovery-authorization", "POST"));
+    await waitFor(() => expect(window.location.hash).toBe("#knowledge-oauth"));
+    expect(request.mock.calls.some(([path]) => path.endsWith("/tools/sync"))).toBe(false);
+  });
+
+  it("resumes discovery and synchronizes tools after the administrator OAuth callback succeeds", async () => {
+    useAuthStore.getState().auth.setUser({ id: 1, username: "root", role: 100 });
+    window.history.replaceState({}, "", "/mcp?server_id=library&discover=true#mcp_state=state&mcp_code=code&mcp_iss=issuer");
+    const server = { id: "library", name: "Public manual", kind: "public_knowledge", enabled: false, revision: 3, connection: { transport: "streamable_http", url: "https://gateway.test/mcp/providers/knowledge/owner/manual" } };
+    let authorized = false;
+    request.mockImplementation(async (path: string) => {
+      if (path === "/oauth/callback") { authorized = true; return { admin: true }; }
+      if (path.startsWith("/servers?")) return { items: [server], total: 1, page: 1, page_size: 20 };
+      if (path.endsWith("/discoveries")) {
+        expect(authorized).toBe(true);
+        return { discovery_id: "discovery", server_revision: 3, added: ["create_consultation", "get_consultation_result"], changed: [], removed: [] };
+      }
+      if (path.endsWith("/tools")) return [];
+      return server;
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    clients.push(client);
+    client.setQueryData(["status"], { mcp_enabled: true });
+    render(<QueryClientProvider client={client}><MCPManagement /></QueryClientProvider>);
+    await waitFor(() => expect(request).toHaveBeenCalledWith("/servers/library/tools/sync", "POST", { discovery_id: "discovery", expected_revision: 3 }));
+    expect(request.mock.calls.filter(([path]) => path === "/oauth/callback")).toHaveLength(1);
+    expect(request.mock.calls.filter(([path]) => path.endsWith("/discoveries"))).toHaveLength(1);
+    expect(window.location.hash).toBe("");
+    expect(new URLSearchParams(window.location.search).has("discover")).toBe(false);
+  });
+
   it.each([
     ["popup", true], ["popup", false],
     ["marketplace", true], ["marketplace", false],
@@ -533,6 +586,49 @@ describe("MCP authorization return", () => {
 });
 
 describe("MCP real test interaction", () => {
+  it.each([false, true])("renders answer chunks before completion and replaces the preview with the saved result (interrupted=%s)", async (interrupted) => {
+    let update: ((event: import('../types').ConsultationUpdate) => void) | undefined;
+    let end: ((value: {invocation_id: string; interrupted: boolean}) => void) | undefined;
+    let signal: AbortSignal | undefined;
+    let finished = false;
+    streamRequest.mockImplementation((_path, _body, _key, inputSignal, accepted, onUpdate) => {
+      signal = inputSignal;
+      update = onUpdate;
+      accepted('stream-call');
+      return new Promise((resolve) => { end = resolve; });
+    });
+    request.mockImplementation(async (path: string) => {
+      if (path.endsWith('/tools')) return [{id:'consult', name:'get_consultation_result', revision:1, input_schema:{properties:{}},pricing:{charge_quota:0}}];
+      if (!finished) return {invocation:{status:'running',billing_status:'free'}};
+      return {invocation:{status:'succeeded',billing_status:'free'},result:{structuredContent:{answer:'Authoritative answer',status:'completed',done:true,citations:[]}}};
+    });
+    const user = userEvent.setup();
+    const view = renderMCPTest();
+    await user.click(await screen.findByRole('button',{name:'get_consultation_result'}));
+    await user.click(screen.getByRole('button',{name:'Execute'}));
+    await waitFor(() => expect(streamRequest).toHaveBeenCalledOnce());
+    act(() => {
+      update?.({task_id:'task-one',type:'answer_delta',text:'Hello '});
+      update?.({task_id:'task-one',type:'answer_delta',text:'world'});
+      update?.({task_id:'task-one',type:'citation',title:'Reference',url:'https://example.test/source'});
+      update?.({task_id:'task-one',type:'citation',title:'Unsafe reference',url:'javascript:alert(1)'});
+    });
+    expect(await within(screen.getByRole('region',{name:'Answer'})).findByText('Hello world')).toBeVisible();
+    expect(screen.getByRole('link',{name:'Reference'})).toHaveAttribute('href','https://example.test/source');
+    expect(screen.queryByRole('link',{name:'Unsafe reference'})).toBeNull();
+    expect(screen.getByRole('button',{name:'Execute'})).toBeDisabled();
+    await act(async () => end?.({invocation_id:'stream-call',interrupted}));
+    if (interrupted) expect(screen.getByText('Live updates disconnected. Waiting for the saved result.')).toBeVisible();
+    finished = true;
+    await act(async () => view.client.refetchQueries({queryKey:['mcp','test-result','stream-call']}));
+    expect(await within(screen.getByRole('region',{name:'Answer'})).findByText('Authoritative answer')).toBeVisible();
+    expect(screen.queryByText('Hello world')).toBeNull();
+    expect(screen.getByRole('button',{name:'Execute'})).toBeEnabled();
+    expect(streamRequest).toHaveBeenCalledOnce();
+    view.unmount();
+    expect(signal?.aborted).toBe(true);
+  });
+
   it("keeps only one tool open and preserves arguments across pointer and keyboard toggles", async () => {
     request.mockResolvedValue([
       { id: "fetch", name: "web_fetch", pricing: { charge_quota: 0 }, input_schema: { properties: { url: { type: "string" } }, required: ["url"] } },
@@ -812,6 +908,47 @@ describe("MCP configuration and charge confirmation", () => {
       },
       limits: { timeout_seconds: 60, max_concurrency: 10 },
     });
+  });
+  it("registers a fixed public library through the standard MCP URL form", async () => {
+    request.mockImplementation(async (_path, method) =>
+      method === "POST" ? { id: "library-service" } : { callback_url: "https://gateway.test/api/mcp/oauth/callback" },
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    clients.push(client);
+    const created = vi.fn();
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ServerForm sensitive onClose={() => {}} onCreated={created} /></QueryClientProvider>);
+    await user.type(screen.getByLabelText("Display name"), "Public manual");
+    await user.type(screen.getByLabelText("Upstream URL"), "https://gateway.test/mcp/providers/knowledge/library-owner/manual");
+    expect(screen.queryByLabelText("Library owner")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Knowledge base ID")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(created).toHaveBeenCalledWith("library-service"));
+    expect(request).toHaveBeenCalledWith("/servers", "POST", expect.objectContaining({
+      connection: { transport: "streamable_http", url: "https://gateway.test/mcp/providers/knowledge/library-owner/manual" },
+    }));
+  });
+  it("keeps the library binding fixed while editing its display name", async () => {
+    request.mockResolvedValue({ callback_url: "https://gateway.test/api/mcp/oauth/callback" });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    clients.push(client);
+    const closed = vi.fn();
+    const user = userEvent.setup();
+    const endpoint = "https://gateway.test/mcp/providers/knowledge/library-owner/manual";
+    render(<QueryClientProvider client={client}><ServerForm sensitive onClose={closed} server={{
+      id: "library-service", name: "Manual", kind: "public_knowledge", revision: 1,
+      connection: { transport: "streamable_http", url: endpoint, owner: "library-owner", kb_id: "manual" },
+      limits: { timeout_seconds: 60, max_concurrency: 10 },
+    } as MCPServer} /></QueryClientProvider>);
+    expect(screen.getByLabelText("Upstream URL")).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Transport" })).toBeDisabled();
+    await user.clear(screen.getByLabelText("Display name"));
+    await user.type(screen.getByLabelText("Display name"), "Public manual");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(closed).toHaveBeenCalled());
+    expect(request).toHaveBeenCalledWith("/servers/library-service", "PATCH", expect.objectContaining({
+      name: "Public manual", connection: { transport: "streamable_http", url: endpoint },
+    }));
   });
   it.each(["", "replacement-secret"])("saves automatic scope discovery with client secret input %j", async (secret) => {
     request.mockResolvedValue({ callback_url: "https://gateway.test/api/mcp/oauth/callback" });

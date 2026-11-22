@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/QuantumNous/new-api/constant"
+	"maps"
 	"math/rand/v2"
 	"regexp"
 	"slices"
@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/google/uuid"
@@ -75,7 +76,7 @@ func PrepareCall(serverID, toolName string, actor *Actor, arguments map[string]a
 		return nil, Failure(422, "INVALID_ARGUMENTS", "Tool arguments are too large")
 	}
 	key := options.IdempotencyKey
-	if toolName == "create_consultation" && (server.Kind == "knowledge" || server.Kind == "public_knowledge") {
+	if toolName == "create_consultation" && server.Kind == "knowledge" {
 		key = arguments["request_id"].(string)
 	}
 	if (options.Test || options.ConfirmPrice) && options.IdempotencyKey == "" {
@@ -284,7 +285,14 @@ func (call *PreparedCall) Run(ctx context.Context, progress Progress) (*mcpsdk.C
 	if call.actor.DelegationToken != "" || call.actor.AccessToken != "" && (!call.server.Catalog || call.server.Kind != "remote_mcp") {
 		go call.monitorAuthorization(ctx, cancel)
 	}
-	outcome, err := ExecuteAdapter(ctx, call.server, call.tool, call.actor, call.args, call.options.IdempotencyKey, progress)
+	args := call.args
+	if call.server.Kind == "public_knowledge" && call.tool.Name == "create_consultation" {
+		args = maps.Clone(args)
+		// The invocation UUID and timestamp keep the internal request ID stable
+		// when recovering an uncertain upstream response with an Idempotency-Key.
+		args["request_id"] = call.Invocation.ID + "-" + strconv.FormatInt(call.Invocation.CreatedAt.Unix(), 10)
+	}
+	outcome, err := ExecuteAdapter(ctx, call.server, call.tool, call.actor, args, call.options.IdempotencyKey, progress)
 	if err != nil {
 		return call.fail(err, outcome.Unknown)
 	}

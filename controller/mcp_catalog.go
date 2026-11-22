@@ -319,9 +319,14 @@ func MCPCatalogDetail(c *gin.Context) {
 }
 
 func localMCPServer(c *gin.Context) (*model.MCPServer, error) {
-	if id := c.Param("instance"); id != "" {
-		server, err := model.GetMCPServer(id)
-		if err != nil || server.ID != id || c.Param("provider") != "knowledge" || server.Kind != "public_knowledge" || !server.Enabled {
+	if kbID := c.Param("kb_id"); kbID != "" {
+		endpoint := mcpsvc.PublicLibraryURL(c.Param("owner"), kbID)
+		slug := mcpsvc.LocalProviderSlug(endpoint)
+		if c.Param("provider") != "knowledge" || slug == "" {
+			return nil, gorm.ErrRecordNotFound
+		}
+		server, err := model.GetMCPServerBySlug(slug)
+		if err != nil || server.Kind != "public_knowledge" || server.Connection.URL != endpoint || server.Connection.Owner != c.Param("owner") || server.Connection.KBID != kbID || !server.Enabled {
 			return nil, gorm.ErrRecordNotFound
 		}
 		return server, nil
