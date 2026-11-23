@@ -34,6 +34,83 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+func TestMCPGatewayIsolatesUnavailableServices(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		refresh bool
+	}{
+		{name: "upstream unavailable", status: http.StatusServiceUnavailable},
+		{name: "upstream authorization rejected", status: http.StatusUnauthorized},
+		{name: "OAuth refresh unavailable", status: http.StatusServiceUnavailable, refresh: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupMCPService(t)
+			var calls atomic.Int32
+			upstream := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "healthy", Version: "1"}, nil)
+			upstream.AddTool(&mcpsdk.Tool{Name: "echo", InputSchema: map[string]any{"type": "object"}}, func(context.Context, *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+				calls.Add(1)
+				return &mcpsdk.CallToolResult{Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: "healthy result"}}}, nil
+			})
+			healthy := httptest.NewServer(mcpsdk.NewStreamableHTTPHandler(func(*http.Request) *mcpsdk.Server { return upstream }, &mcpsdk.StreamableHTTPOptions{Stateless: true}))
+			defer healthy.Close()
+			unavailable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+			}))
+			defer unavailable.Close()
+			t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", healthy.URL+","+unavailable.URL)
+			require.NoError(t, model.DB.Create(&model.User{Id: 901, Username: "gateway-isolation", Status: common.UserStatusEnabled, Group: "default"}).Error)
+			for i, endpoint := range []string{unavailable.URL, healthy.URL} {
+				id := fmt.Sprintf("gateway-isolation-%d", i)
+				server := model.MCPServer{ID: id, Slug: id, Name: id, Catalog: true, Kind: "remote_mcp", Enabled: true, ConnectionRevision: 1,
+					Connection: model.MCPConnection{URL: endpoint, Transport: "streamable_http"}, Limits: model.MCPLimits{TimeoutSeconds: 5, MaxConcurrency: 10}}
+				if i == 0 && tc.refresh {
+					server.Connection.ClientID = "unavailable-client"
+				}
+				require.NoError(t, model.DB.Create(&server).Error)
+				require.NoError(t, model.DB.Create(&model.MCPTool{ID: id, ServerID: id, Name: "echo", Enabled: true, InputSchema: model.MCPJSON{"type": "object"}, PriceMode: "free", UnitPriceUSD: "0"}).Error)
+				require.NoError(t, model.DB.Create(&model.MCPInstallation{ID: id, ServerID: id, UserID: 901, Authorized: true, ConnectionRevision: 1}).Error)
+				if i == 0 && tc.refresh {
+					shared, err := Install(id, 901, true)
+					require.NoError(t, err)
+					grant, err := common.Marshal(oauthGrant{Token: oauth2.Token{AccessToken: "expired", RefreshToken: "refresh", Expiry: time.Now().Add(-time.Hour)}, Metadata: oauthDiscovery{TokenURL: endpoint + "/token"}})
+					require.NoError(t, err)
+					sealed, err := Seal(string(grant), "oauth-grant:"+shared.ID)
+					require.NoError(t, err)
+					require.NoError(t, model.DB.Model(shared).Updates(map[string]any{"authorized": true, "grant_ciphertext": sealed}).Error)
+				}
+			}
+			actor := &Actor{UserID: 901, Group: "default", CanCall: true, Delegation: &MCPDelegation{ServerIDs: []string{"*"}}}
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := ServeGateway(w, r, actor); err != nil {
+					http.Error(w, ErrorResponse(err).Code, ErrorResponse(err).Status)
+				}
+			}))
+			defer gateway.Close()
+			client, err := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "isolation-test", Version: "1"}, nil).Connect(t.Context(), &mcpsdk.StreamableClientTransport{Endpoint: gateway.URL, DisableStandaloneSSE: true, MaxRetries: -1}, nil)
+			require.NoError(t, err, "an unavailable service must not prevent initialization")
+			defer client.Close()
+			directory, err := client.ListTools(t.Context(), nil)
+			require.NoError(t, err)
+			require.Len(t, directory.Tools, 1)
+			healthyName := "mcp_" + Digest("gateway-isolation-1\x00echo")[:40]
+			assert.Equal(t, healthyName, directory.Tools[0].Name)
+			result, err := client.CallTool(t.Context(), &mcpsdk.CallToolParams{Name: healthyName, Arguments: map[string]any{}})
+			require.NoError(t, err)
+			assert.False(t, result.IsError)
+			require.Len(t, result.Content, 1)
+			assert.Equal(t, "healthy result", result.Content[0].(*mcpsdk.TextContent).Text)
+			_, err = client.CallTool(t.Context(), &mcpsdk.CallToolParams{Name: "mcp_" + Digest("gateway-isolation-0\x00echo")[:40], Arguments: map[string]any{}})
+			require.Error(t, err, "unavailable tools must not fall back to another service")
+			assert.EqualValues(t, 1, calls.Load())
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			err = ServeGateway(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodPost, "/mcp/gateway", nil), actor)
+			require.ErrorIs(t, err, context.Canceled)
+		})
+	}
+}
+
 func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 	setupMCPService(t)
 	key, err := rsa.GenerateKey(rand.Reader, 2048)

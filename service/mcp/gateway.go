@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 )
 
@@ -36,10 +37,14 @@ func GatewayServices(ctx context.Context, actor *Actor) ([]GatewayService, error
 		}
 		connected, err := InstallationActor(ctx, server, actor, false)
 		if err != nil {
-			if ErrorResponse(err).Status < 500 {
-				continue // Expired, revoked or missing upstream authorization is never replaced.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
-			return nil, err
+			if failure := ErrorResponse(err); failure.Status >= 500 {
+				logger.LogWarn(ctx, "MCP gateway authorization unavailable: service=%s code=%s", server.ID, failure.Code)
+			}
+			// A failed grant excludes only this service; never substitute credentials.
+			continue
 		}
 		services = append(services, GatewayService{ID: server.ID, Name: server.Name, URL: PublicBaseURL() + "/mcp/" + server.ID, server: server, actor: connected})
 	}
@@ -57,10 +62,14 @@ func ServeGateway(w http.ResponseWriter, r *http.Request, actor *Actor) error {
 	for _, service := range services {
 		views, err := AvailableTools(r.Context(), service.server, service.actor)
 		if err != nil {
-			if ErrorResponse(err).Status < 500 {
-				continue
+			if r.Context().Err() != nil {
+				return r.Context().Err()
 			}
-			return err
+			if failure := ErrorResponse(err); failure.Status >= 500 {
+				logger.LogWarn(r.Context(), "MCP gateway tools unavailable: service=%s code=%s", service.ID, failure.Code)
+			}
+			// Upstream outages must not hide tools belonging to healthy services.
+			continue
 		}
 		for _, view := range views {
 			tool := view.MCPTool
