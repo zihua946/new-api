@@ -13,7 +13,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -165,12 +164,12 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 	t.Cleanup(provider.Close)
 	issuer = provider.URL
 	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", issuer)
-	t.Setenv("MCP_CASDOOR_ISSUER", issuer)
-	t.Setenv("MCP_CASDOOR_ORGANIZATION", "knowyet")
-	t.Setenv("MCP_CASDOOR_PROVIDER_ID", "1")
-	t.Setenv("MCP_OAUTH_CLIENT_ID", "resource-verifier")
-	t.Setenv("MCP_OAUTH_CLIENT_SECRET", "verifier-secret")
-	t.Setenv("MCP_OAUTH_ALLOWED_CLIENT_IDS", "resource-verifier, connector-client")
+	setMCPSetting(t, "casdoor_issuer", issuer)
+	setMCPSetting(t, "casdoor_organization", "knowyet")
+	setMCPSetting(t, "casdoor_provider_id", "1")
+	setMCPSetting(t, "oauth_client_id", "resource-verifier")
+	setMCPSetting(t, "oauth_client_secret", "verifier-secret")
+	setMCPSetting(t, "oauth_allowed_client_ids", "resource-verifier, connector-client")
 	require.NoError(t, model.DB.Create(&model.User{Id: 100, Username: "alice", Group: "default", Status: common.UserStatusEnabled}).Error)
 	require.NoError(t, model.DB.Create(&model.CustomOAuthProvider{Id: 1, Name: "Casdoor", Slug: "casdoor", Enabled: true, UserIdField: "sub", WellKnown: issuer + "/.well-known/openid-configuration"}).Error)
 	require.NoError(t, model.DB.Create(&model.UserOAuthBinding{UserId: 100, ProviderId: 1, ProviderUserId: "stable-alice"}).Error)
@@ -223,10 +222,10 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 			_, err = AuthenticateOAuth(context.Background(), server, raw)
 			require.NoError(t, err, "standard introspection permits string audience")
 			introspectionPatch = map[string]any{}
-			t.Setenv("MCP_OAUTH_ALLOWED_CLIENT_IDS", "")
+			setMCPSetting(t, "oauth_allowed_client_ids", "")
 			_, err = AuthenticateOAuth(context.Background(), server, raw)
 			require.Error(t, err, "unconfigured external clients must not be allowed by default")
-			t.Setenv("MCP_OAUTH_ALLOWED_CLIENT_IDS", "resource-verifier, connector-client")
+			setMCPSetting(t, "oauth_allowed_client_ids", "resource-verifier, connector-client")
 			active.Store(false)
 			_, err = AuthenticateOAuth(context.Background(), server, raw)
 			require.Error(t, err)
@@ -236,7 +235,7 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 	}
 
 	t.Run("public knowledge admits live dynamic registrations without a client allowlist", func(t *testing.T) {
-		t.Setenv("MCP_OAUTH_ALLOWED_CLIENT_IDS", "")
+		setMCPSetting(t, "oauth_allowed_client_ids", "")
 		knowledge := &model.MCPServer{Kind: "public_knowledge", Catalog: true, Connection: model.MCPConnection{URL: resource}}
 		for _, tc := range []struct {
 			name         string
@@ -374,10 +373,10 @@ data: {"type":"completed"}
 			}
 		}))
 		defer engine.Close()
-		t.Setenv("MCP_KNOWLEDGE_ENGINE_URL", engine.URL)
-		t.Setenv("MCP_KNOWLEDGE_CLIENT_ID", "business")
-		t.Setenv("MCP_KNOWLEDGE_CLIENT_SECRET", "engine-exchange")
-		t.Setenv("MCP_KNOWLEDGE_OAUTH_CLIENT_SECRET", "casdoor-secret")
+		setMCPSetting(t, "knowledge_engine_url", engine.URL)
+		setMCPSetting(t, "knowledge_client_id", "business")
+		setMCPSetting(t, "knowledge_client_secret", "engine-exchange")
+		setMCPSetting(t, "knowledge_oauth_client_secret", "casdoor-secret")
 		t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", issuer+","+engine.URL)
 		var config ServerInput
 		require.NoError(t, common.UnmarshalJsonStr(`{"name":"Manual","icon":"OpenAI","readme":"Library guide","connection":{"transport":"streamable_http","url":"https://gateway.test/mcp/providers/knowledge/library-owner/manual"}}`, &config))
@@ -700,26 +699,26 @@ data: {"type":"completed"}
 		assert.Equal(t, cached.token, aliceClient.token)
 		assert.Equal(t, before+1, exchanges.Load())
 
-		t.Setenv("MCP_KNOWLEDGE_CLIENT_ID", "other-business")
+		setMCPSetting(t, "knowledge_client_id", "other-business")
 		otherClaims := maps.Clone(appClaims)
 		otherClaims["aud"], otherClaims["azp"] = "other-business", "other-business"
 		require.NoError(t, storeEngineGrant(ctx, 100, oauth2.Token{AccessToken: sign(otherClaims), Expiry: time.Now().Add(time.Hour)}))
 		otherClient, err := publicLibraryClient(ctx, server, actor)
 		require.NoError(t, err)
 		assert.NotEqual(t, cached.token, otherClient.token)
-		t.Setenv("MCP_KNOWLEDGE_CLIENT_ID", "business")
+		setMCPSetting(t, "knowledge_client_id", "business")
 		cached, err = publicLibraryClient(ctx, server, actor)
 		require.NoError(t, err)
 		assert.Equal(t, aliceClient.token, cached.token)
 
 		before = exchanges.Load()
-		t.Setenv("MCP_KNOWLEDGE_CLIENT_SECRET", "rotated-exchange")
+		setMCPSetting(t, "knowledge_client_secret", "rotated-exchange")
 		expectedSecret.Store("rotated-exchange")
 		rotated, err := publicLibraryClient(ctx, server, actor)
 		require.NoError(t, err)
 		assert.Equal(t, before+1, exchanges.Load())
 		assert.NotEqual(t, cached.token, rotated.token)
-		t.Setenv("MCP_KNOWLEDGE_CLIENT_SECRET", "engine-exchange")
+		setMCPSetting(t, "knowledge_client_secret", "engine-exchange")
 		expectedSecret.Store("engine-exchange")
 		renewedClaims := maps.Clone(appClaims)
 		renewedClaims["grant_revision"] = "renewed"
@@ -744,7 +743,7 @@ data: {"type":"completed"}
 		require.NoError(t, storeEngineGrant(ctx, 100, oauth2.Token{AccessToken: renewedToken, Expiry: time.Now().Add(time.Hour)}))
 		// Missing introspection credentials preserve public-client compatibility
 		// through fresh exchanges, rather than serving an unchecked cached JWT.
-		t.Setenv("MCP_KNOWLEDGE_OAUTH_CLIENT_SECRET", "")
+		setMCPSetting(t, "knowledge_oauth_client_secret", "")
 		before = exchanges.Load()
 		for range 2 {
 			_, err = publicLibraryClient(ctx, server, actor)
@@ -824,9 +823,9 @@ data: {"type":"completed"}
 
 	})
 	t.Run("local provider shares pricing and idempotency with catalog", func(t *testing.T) {
-		t.Setenv("MCP_OAUTH_CLIENT_ID", "")
-		t.Setenv("MCP_OAUTH_CLIENT_SECRET", "")
-		t.Setenv("MCP_OAUTH_ALLOWED_CLIENT_IDS", "")
+		setMCPSetting(t, "oauth_client_id", "")
+		setMCPSetting(t, "oauth_client_secret", "")
+		setMCPSetting(t, "oauth_allowed_client_ids", "")
 		ctx := context.Background()
 		resource = "https://gateway.test/mcp/providers/deepseek"
 		claims := maps.Clone(base)
@@ -844,11 +843,10 @@ data: {"type":"completed"}
 		}))
 		defer fixture.Close()
 		t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", issuer+","+fixture.URL)
-		t.Setenv("MCP_DEEPSEEK_CHANNEL_ID", "1234")
-		t.Setenv("MCP_DEEPSEEK_BASE_URL", fixture.URL)
+
 		require.NoError(t, model.DB.Create(&model.Channel{Id: 1234, Name: "local-provider", Type: constant.ChannelTypeDeepSeek, Status: common.ChannelStatusEnabled, Key: "supplier-key", BaseURL: &fixture.URL}).Error)
 		require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 100).Update("quota", 2000).Error)
-		input := ServerInput{Icon: "OpenAI", Readme: "Fixture README", Name: "Search", ClientSecret: "verifier-secret", AuthMode: "oauth2", Connection: model.MCPConnection{URL: resource, Transport: "streamable_http", ClientID: "connector-client"}}
+		input := ServerInput{Icon: "OpenAI", Readme: "Fixture README", Name: "Search", ClientSecret: "verifier-secret", AuthMode: "oauth2", Connection: model.MCPConnection{URL: resource, Transport: "streamable_http", ClientID: "connector-client", ChannelID: 1234, ConfirmedBaseURL: fixture.URL}}
 		server, err := CreateServer(input)
 		require.NoError(t, err)
 		_, err = CreateServer(input)
@@ -901,7 +899,6 @@ func setupMCPService(t *testing.T) {
 	t.Setenv("SQL_DSN", testDSN)
 	t.Setenv("LOG_SQL_DSN", "")
 	t.Setenv("MCP_ENCRYPTION_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
-	t.Setenv("MCP_PUBLIC_BASE_URL", "https://gateway.test")
 	common.SQLitePath = filepath.Join(t.TempDir(), "mcp-service.db")
 	common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.QuotaPerUnit = true, false, false, false, 500000
 	require.NoError(t, model.InitDB())
@@ -916,6 +913,7 @@ func setupMCPService(t *testing.T) {
 		common.SetLogDatabaseType(priorLogType)
 		common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.QuotaPerUnit = priorMaster, priorRedis, priorMemory, priorBatch, priorUnit
 	})
+	setMCPSetting(t, "public_base_url", "https://gateway.test")
 }
 
 func TestMCPDeepSeekExecutionAndKeyIsolation(t *testing.T) {
@@ -937,8 +935,8 @@ func TestMCPDeepSeekExecutionAndKeyIsolation(t *testing.T) {
 	}))
 	t.Cleanup(upstream.Close)
 	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", upstream.URL)
-	t.Setenv("MCP_CASDOOR_ISSUER", "")
-	t.Setenv("MCP_CASDOOR_PROVIDER_ID", "")
+	setMCPSetting(t, "casdoor_issuer", "")
+	setMCPSetting(t, "casdoor_provider_id", "")
 	user := model.User{Id: 100, Username: "mcp-user", Group: "default", Status: common.UserStatusEnabled, Quota: 1000}
 	key := model.Token{Id: 200, UserId: user.Id, Key: "ordinary-user-key", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000}
 	channel := model.Channel{Id: 12, Name: "DeepSeek", Type: constant.ChannelTypeDeepSeek, Key: "provider-key-one", Status: common.ChannelStatusEnabled, BaseURL: &upstream.URL}
@@ -1400,11 +1398,14 @@ func TestMCPCredentialsAreBoundToRecord(t *testing.T) {
 }
 
 func TestMCPLocalDeploymentOAuthClient(t *testing.T) {
+	setupMCPService(t)
 	t.Setenv("MCP_ENCRYPTION_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
-	t.Setenv("MCP_PUBLIC_BASE_URL", "https://gateway.test")
-	t.Setenv("MCP_CASDOOR_ISSUER", "https://issuer.test")
-	t.Setenv("MCP_OAUTH_CLIENT_ID", "")
-	t.Setenv("MCP_OAUTH_CLIENT_SECRET", "")
+	setMCPSetting(t, "public_base_url", "https://gateway.test")
+	setMCPSetting(t, "casdoor_issuer", "https://issuer.test")
+	setMCPSetting(t, "casdoor_provider_id", "1")
+	require.NoError(t, model.DB.Create(&model.CustomOAuthProvider{Id: 1, Enabled: true, UserIdField: "sub", WellKnown: "https://issuer.test/.well-known/openid-configuration"}).Error)
+	setMCPSetting(t, "oauth_client_id", "")
+	setMCPSetting(t, "oauth_client_secret", "")
 	sealed, err := Seal("fixture-secret", "oauth-client:local-server")
 	require.NoError(t, err)
 	server := &model.MCPServer{ID: "local-server", CredentialCiphertext: sealed, Kind: "deepseek", Catalog: true, Connection: model.MCPConnection{URL: "https://gateway.test/mcp/providers/deepseek", ClientID: "local-client"}}
@@ -1425,7 +1426,8 @@ func TestMCPLocalDeploymentOAuthClient(t *testing.T) {
 }
 
 func TestMCPRetiredKnowledgeProvider(t *testing.T) {
-	t.Setenv("MCP_PUBLIC_BASE_URL", "https://gateway.test")
+	setupMCPService(t)
+	setMCPSetting(t, "public_base_url", "https://gateway.test")
 	assert.Empty(t, BuiltinTools("knowledge"))
 	assert.Len(t, BuiltinTools("public_knowledge"), 2)
 	assert.Len(t, BuiltinTools("deepseek"), 2)
@@ -1596,8 +1598,8 @@ func TestMCPRemoteDiscoveryAndSessionIsolation(t *testing.T) {
 
 func TestMCPAPIKeyAuthorizationWithoutIdentityBinding(t *testing.T) {
 	setupMCPService(t)
-	t.Setenv("MCP_CASDOOR_ISSUER", "")
-	t.Setenv("MCP_CASDOOR_PROVIDER_ID", "")
+	setMCPSetting(t, "casdoor_issuer", "")
+	setMCPSetting(t, "casdoor_provider_id", "")
 	restrictedIPs := "192.0.2.0/24"
 	for i, tc := range []struct {
 		name, authMode, kind, header, group string
@@ -1824,55 +1826,6 @@ func TestMCPCatalogTransportsAndOAuthInstallation(t *testing.T) {
 	}
 }
 
-func TestMCPPinnedStdioPackage(t *testing.T) {
-	registry := os.Getenv("MCP_TEST_STDIO_REGISTRY")
-	if registry == "" {
-		t.Skip("set MCP_TEST_STDIO_REGISTRY to an isolated loopback OCI registry")
-	}
-	require.True(t, strings.HasPrefix(registry, "localhost:") || strings.HasPrefix(registry, "127.0.0.1:"))
-	setupMCPService(t)
-	dir := t.TempDir()
-	source := `package main
-import("context";"os";"github.com/modelcontextprotocol/go-sdk/mcp")
-type Args struct{}
-type Result struct {Argument string; Public string; Private string; UID int}
-func main(){
- s:=mcp.NewServer(&mcp.Implementation{Name:"stdio-fixture",Version:"1.2.3"},nil)
- mcp.AddTool(s,&mcp.Tool{Name:"environment",Description:"read the fixture environment"},func(context.Context,*mcp.CallToolRequest,Args)(*mcp.CallToolResult,Result,error){return nil,Result{os.Args[1],os.Getenv("DECLARED"),os.Getenv("MCP_PRIVATE_FIXTURE"),os.Getuid()},nil})
- _=s.Run(context.Background(),&mcp.StdioTransport{})
-}`
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(source), 0600))
-	build := exec.Command("go", "build", "-o", filepath.Join(dir, "fixture"), filepath.Join(dir, "main.go"))
-	build.Env = append(os.Environ(), "GOOS=linux", "CGO_ENABLED=0")
-	out, err := build.CombinedOutput()
-	require.NoError(t, err, string(out))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\nCOPY fixture /fixture\n"), 0600))
-	ref := registry + "/mcp/test:1.2.3"
-	for _, args := range [][]string{{"build", "-q", "-t", ref, dir}, {"push", ref}} {
-		out, err := exec.Command("docker", args...).CombinedOutput()
-		require.NoError(t, err, string(out))
-	}
-	t.Setenv("MCP_STDIO_PACKAGE_SOURCES", registry+"/mcp")
-	t.Setenv("MCP_PRIVATE_FIXTURE", "gateway-only")
-	server, err := CreateServer(ServerInput{Name: "Stdio fixture", Env: map[string]string{"DECLARED": "service value"}, Connection: model.MCPConnection{Transport: "stdio", Command: "/fixture 'two words'", Package: ref}})
-	require.NoError(t, err)
-	_, err = DiscoverTools(t.Context(), server.ID, 1)
-	require.Error(t, err)
-	server, err = InstallPackage(t.Context(), server.ID, server.Revision)
-	require.NoError(t, err)
-	require.Regexp(t, "^sha256:[a-f0-9]{64}$", server.Connection.PackageDigest)
-	discovery, err := DiscoverTools(t.Context(), server.ID, 1)
-	require.NoError(t, err)
-	tools := discovery["tools"].([]model.MCPTool)
-	require.Len(t, tools, 1)
-	result, err := ExecuteAdapter(t.Context(), server, &tools[0], &Actor{}, map[string]any{}, "", nil)
-	require.NoError(t, err)
-	assert.Contains(t, fmt.Sprint(result.Result.StructuredContent), "two words")
-	assert.Contains(t, fmt.Sprint(result.Result.StructuredContent), "service value")
-	assert.NotContains(t, fmt.Sprint(result.Result.StructuredContent), "gateway-only")
-	assert.Contains(t, fmt.Sprint(result.Result.StructuredContent), "65534")
-}
-
 func TestMCPAutomaticDiscoveryAuthorization(t *testing.T) {
 	setupMCPService(t)
 	mux := http.NewServeMux()
@@ -2055,17 +2008,19 @@ func TestMCPOAuthScopeDiscovery(t *testing.T) {
 
 func TestMCPLocalDynamicClientRegistration(t *testing.T) {
 	setupMCPService(t)
-	t.Setenv("MCP_OAUTH_CLIENT_ID", "")
-	t.Setenv("MCP_OAUTH_CLIENT_SECRET", "")
-	t.Setenv("MCP_CASDOOR_ORGANIZATION", "mcp-local")
+	setMCPSetting(t, "oauth_client_id", "")
+	setMCPSetting(t, "oauth_client_secret", "")
+	setMCPSetting(t, "casdoor_organization", "mcp-local")
 	var registrations atomic.Int32
 	var reject atomic.Bool
 	reject.Store(true)
 	mux := http.NewServeMux()
 	fixture := httptest.NewServer(mux)
 	defer fixture.Close()
-	t.Setenv("MCP_PUBLIC_BASE_URL", fixture.URL)
-	t.Setenv("MCP_CASDOOR_ISSUER", fixture.URL)
+	setMCPSetting(t, "public_base_url", fixture.URL)
+	setMCPSetting(t, "casdoor_issuer", fixture.URL)
+	setMCPSetting(t, "casdoor_provider_id", "1")
+	require.NoError(t, model.DB.Create(&model.CustomOAuthProvider{Id: 1, Enabled: true, UserIdField: "sub", WellKnown: fixture.URL + "/.well-known/openid-configuration"}).Error)
 	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", fixture.URL)
 	endpoint := fixture.URL + "/mcp/providers/deepseek"
 	meta := oauthDiscovery{Issuer: fixture.URL, AuthURL: fixture.URL + "/authorize", TokenURL: fixture.URL + "/token", RegistrationURL: fixture.URL + "/register", Challenges: []string{"S256"}, Scopes: []string{"mcp:tools:read", "mcp:tools:call"}}
@@ -2230,4 +2185,110 @@ func TestToolInvocationHTTPConnectionReuse(t *testing.T) {
 	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", "")
 	_, err = requestHTTPClient(ctx, upstream.URL, time.Second)
 	require.Error(t, err, "revoked origin configuration must not reuse a previously allowed transport")
+}
+
+func setMCPSetting(t *testing.T, key, value string) {
+	t.Helper()
+	var previous model.MCPSettings
+	result := model.DB.First(&previous, 1)
+	values := map[string]string{}
+	if result.Error == nil {
+		raw, err := Open(string(previous.Payload), "mcp-settings")
+		require.NoError(t, err)
+		require.NoError(t, common.UnmarshalJsonStr(raw, &values))
+	}
+	values[key] = value
+	raw, err := common.Marshal(values)
+	require.NoError(t, err)
+	sealed, err := Seal(string(raw), "mcp-settings")
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Save(&model.MCPSettings{ID: 1, Revision: previous.Revision + 1, Payload: model.MCPEncryptedResult(sealed)}).Error)
+	db := model.DB
+	t.Cleanup(func() {
+		if result.Error == nil {
+			require.NoError(t, db.Save(&previous).Error)
+		} else {
+			require.NoError(t, db.Delete(&model.MCPSettings{}, 1).Error)
+		}
+	})
+}
+
+func TestMCPDatabaseSettingsAndRetiredTransport(t *testing.T) {
+	setupMCPService(t)
+	require.NoError(t, model.DB.Where("id IN ?", []string{"app-service", "retired-stdio"}).Delete(&model.MCPServer{}).Error)
+	require.NoError(t, model.DB.Where("id = ?", "snapshot-install").Delete(&model.MCPInstallation{}).Error)
+	require.NoError(t, model.DB.Where("id = ?", "test-app").Delete(&model.MCPTrustedApplication{}).Error)
+	t.Setenv("MCP_OAUTH_CLIENT_SECRET", "ignored-deployment-secret")
+	before, err := ReadSettings()
+	require.NoError(t, err)
+	view, err := SaveSettings(t.Context(), before.Revision, map[string]string{"oauth_client_id": "verifier", "oauth_client_secret": "private-fixture", "knowledge_scopes": "openid system.login"})
+	require.NoError(t, err)
+	assert.True(t, view.Secrets["oauth_client_secret"])
+	assert.NotContains(t, view.Values, "oauth_client_secret")
+	assert.Equal(t, "verifier", view.Effective["oauth_allowed_client_ids"])
+	assert.Equal(t, "private-fixture", ConfigValue("oauth_client_secret"))
+	var row model.MCPSettings
+	require.NoError(t, model.DB.First(&row, 1).Error)
+	assert.NotContains(t, string(row.Payload), "private-fixture")
+	_, err = SaveSettings(t.Context(), before.Revision, map[string]string{"oauth_client_id": "stale"})
+	assert.ErrorIs(t, err, model.ErrMCPRevisionConflict)
+	_, err = SaveSettings(t.Context(), view.Revision, map[string]string{"knowledge_scopes": "system.login"})
+	require.Error(t, err)
+	view, err = SaveSettings(t.Context(), view.Revision, map[string]string{"oauth_client_secret": ""})
+	require.NoError(t, err)
+	assert.False(t, view.Secrets["oauth_client_secret"])
+	assert.Empty(t, ConfigValue("oauth_client_secret"))
+	_, err = CreateServer(ServerInput{Name: "Retired", Connection: model.MCPConnection{Transport: "stdio", Package: "registry.test/mcp/test:1.0", Command: "run"}})
+	require.Error(t, err)
+	assert.Equal(t, "TRANSPORT_RETIRED", ErrorResponse(err).Code)
+	server := model.MCPServer{ID: "app-service", Slug: "app-service", Name: "App service", Kind: "remote_mcp", Catalog: true, Connection: model.MCPConnection{Transport: "streamable_http", URL: "https://example.test/mcp"}}
+	require.NoError(t, model.DB.Create(&server).Error)
+	secret := "a-fixture-exchange-secret-with-32-characters"
+	casdoor := "casdoor-fixture-secret"
+	input := TrustedApplicationInput{Enabled: true, ServerIDs: []string{server.ID}, MaxChargeQuota: 100, ExchangeSecret: &secret, CasdoorClientSecret: &casdoor}
+	require.NoError(t, SaveTrustedApplication("test-app", input))
+	_, oldRevision, err := trustedMCPApp("test-app")
+	require.NoError(t, err)
+	rows, err := ListTrustedApplications()
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	serialized, err := common.Marshal(rows)
+	require.NoError(t, err)
+	assert.NotContains(t, string(serialized), secret)
+	assert.NotContains(t, string(serialized), casdoor)
+	input.ExpectedRevision = 1
+	input.MaxChargeQuota = 10
+	input.ExchangeSecret = nil
+	input.CasdoorClientSecret = nil
+	require.NoError(t, SaveTrustedApplication("test-app", input))
+	_, newRevision, err := trustedMCPApp("test-app")
+	require.NoError(t, err)
+	assert.NotEqual(t, oldRevision, newRevision)
+	assert.ErrorIs(t, SaveTrustedApplication("test-app", input), model.ErrMCPRevisionConflict)
+	input.ExpectedRevision = 2
+	require.NoError(t, SaveTrustedApplication("test-app", input))
+	_, savedRevision, err := trustedMCPApp("test-app")
+	require.NoError(t, err)
+	assert.NotEqual(t, newRevision, savedRevision, "saving identical permissions must not revive old delegations")
+	require.NoError(t, DeleteTrustedApplication("test-app", 3))
+	_, _, err = trustedMCPApp("test-app")
+	require.Error(t, err)
+	snapshot := WithSettingsSnapshot(t.Context())
+	oldURL := PublicBaseURL(snapshot)
+	require.NoError(t, model.DB.Create(&model.MCPInstallation{ID: "snapshot-install", ServerID: server.ID, UserID: 123, Authorized: true, Grant: "old-grant"}).Error)
+	view, err = SaveSettings(t.Context(), view.Revision, map[string]string{"public_base_url": "https://changed.test"})
+	require.NoError(t, err)
+	assert.Equal(t, oldURL, PublicBaseURL(snapshot))
+	assert.Equal(t, "https://changed.test", PublicBaseURL())
+	var installation model.MCPInstallation
+	require.NoError(t, model.DB.First(&installation, "id = ?", "snapshot-install").Error)
+	assert.False(t, installation.Authorized)
+	assert.Empty(t, installation.Grant)
+	legacy := model.MCPServer{ID: "retired-stdio", Slug: "retired-stdio", Name: "Historical service", Catalog: true, Kind: "remote_mcp", Enabled: true, Connection: model.MCPConnection{Transport: "stdio"}}
+	require.NoError(t, model.DB.Create(&legacy).Error)
+	require.NoError(t, model.MigrateMCP(model.DB))
+	require.NoError(t, model.MigrateMCP(model.DB))
+	require.NoError(t, model.DB.First(&legacy, "id = ?", legacy.ID).Error)
+	assert.False(t, legacy.Enabled)
+	assert.Equal(t, "Historical service", legacy.Name)
 }

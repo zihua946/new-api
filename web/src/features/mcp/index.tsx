@@ -39,6 +39,7 @@ import { mcpRequest } from './api'
 import { InvocationList } from './invocations'
 import { ServerForm } from './server-form'
 import { ServiceIcon } from './service-page'
+import { MCPConfiguration } from './settings'
 import { ToolPanel } from './tool-panel'
 import type { MCPPage, MCPServer } from './types'
 
@@ -240,6 +241,10 @@ export function MCPManagement() {
             >
               <TabsList>
                 <TabsTrigger value='servers'>{t('Servers')}</TabsTrigger>
+                <TabsTrigger value='settings'>{t('Settings')}</TabsTrigger>
+                <TabsTrigger value='apps'>
+                  {t('Trusted applications')}
+                </TabsTrigger>
                 <TabsTrigger value='invocations'>
                   {t('Invocations')}
                 </TabsTrigger>
@@ -257,6 +262,12 @@ export function MCPManagement() {
                     toolbarProps={{ searchPlaceholder: t('Search servers...') }}
                   />
                 )}
+              </TabsContent>
+              <TabsContent value='settings' className='overflow-auto'>
+                <MCPConfiguration sensitive={sensitive} />
+              </TabsContent>
+              <TabsContent value='apps' className='overflow-auto'>
+                <MCPConfiguration sensitive={sensitive} apps />
               </TabsContent>
               <TabsContent value='invocations' className='min-h-0 flex-1'>
                 <InvocationList />
@@ -328,14 +339,6 @@ function ServerDetail({
     queryFn: () => mcpRequest<MCPServer>(`/servers/${id}`),
   })
   const client = useQueryClient()
-  const download = useMutation({
-    mutationFn: () =>
-      mcpRequest(`/servers/${id}/package`, 'POST', {
-        expected_revision: server.data?.revision,
-      }),
-    onSuccess: () => client.invalidateQueries({ queryKey: ['mcp'] }),
-    onError: (e) => handleServerError(e),
-  })
   const detectedVersion = server.data?.connection_health?.version
   const useVersion = useMutation({
     mutationFn: (version: string) =>
@@ -375,23 +378,7 @@ function ServerDetail({
             </TabsList>
             <TabsContent value='connection' className='space-y-4 pt-3'>
               <p className='text-sm'>{server.data.description}</p>
-              {server.data.connection.transport === 'stdio' && (
-                <div className='space-y-2'>
-                  <code>{server.data.connection.command}</code>
-                  <p>{server.data.connection.package}</p>
-                  <code className='break-all'>
-                    {server.data.connection.package_digest}
-                  </code>
-                  {sensitive && (
-                    <Button
-                      disabled={download.isPending}
-                      onClick={() => download.mutate()}
-                    >
-                      {t('Download package')}
-                    </Button>
-                  )}
-                </div>
-              )}
+
               <div className='flex items-center gap-2 rounded-md border px-3 py-2'>
                 <code className='min-w-0 text-sm break-all'>
                   {server.data.connection.url}

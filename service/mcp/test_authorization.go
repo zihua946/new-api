@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
 
@@ -18,11 +17,11 @@ func testOAuthConfig(ctx context.Context) (*oauth2.Config, *http.Client, error) 
 	if err != nil {
 		return nil, nil, err
 	}
-	id, secret := os.Getenv("MCP_OAUTH_CLIENT_ID"), os.Getenv("MCP_OAUTH_CLIENT_SECRET")
-	if id == "" || secret == "" || PublicBaseURL() == "" {
+	id, secret := ConfigValue("oauth_client_id", ctx), ConfigValue("oauth_client_secret", ctx)
+	if id == "" || secret == "" || PublicBaseURL(ctx) == "" {
 		return nil, nil, Failure(503, "MCP_NOT_CONFIGURED", "MCP test OAuth client is not configured")
 	}
-	return &oauth2.Config{ClientID: id, ClientSecret: secret, Endpoint: provider.Endpoint(), RedirectURL: PublicBaseURL() + "/api/mcp/test-authorizations/callback", Scopes: []string{"mcp:tools:read", "mcp:tools:call"}}, client, nil
+	return &oauth2.Config{ClientID: id, ClientSecret: secret, Endpoint: provider.Endpoint(), RedirectURL: PublicBaseURL(ctx) + "/api/mcp/test-authorizations/callback", Scopes: []string{"mcp:tools:read", "mcp:tools:call"}}, client, nil
 }
 
 func StartTestAuthorization(ctx context.Context, serverID string, userID int, sessionID string) (map[string]any, error) {
@@ -51,7 +50,7 @@ func StartTestAuthorization(ctx context.Context, serverID string, userID int, se
 	if err = model.DB.Create(&auth).Error; err != nil {
 		return nil, err
 	}
-	authorizationURL := config.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier), oauth2.SetAuthURLParam("resource", ResourceURL(server)))
+	authorizationURL := config.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier), oauth2.SetAuthURLParam("resource", ResourceURL(server, ctx)))
 	return map[string]any{"authorization_url": authorizationURL, "expires_at": auth.ExpiresAt}, nil
 }
 
@@ -83,7 +82,7 @@ func FinishTestAuthorization(ctx context.Context, userID int, sessionID, state, 
 		return "", err
 	}
 	defer client.CloseIdleConnections()
-	token, err := config.Exchange(context.WithValue(ctx, oauth2.HTTPClient, client), code, oauth2.VerifierOption(verifier), oauth2.SetAuthURLParam("resource", ResourceURL(server)))
+	token, err := config.Exchange(context.WithValue(ctx, oauth2.HTTPClient, client), code, oauth2.VerifierOption(verifier), oauth2.SetAuthURLParam("resource", ResourceURL(server, ctx)))
 	if err != nil {
 		return "", Failure(401, "AUTHORIZATION_FAILED", "The authorization code could not be exchanged")
 	}

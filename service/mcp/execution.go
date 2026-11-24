@@ -47,6 +47,9 @@ func PrepareCall(serverID, toolName string, actor *Actor, arguments map[string]a
 	if err != nil {
 		return nil, err
 	}
+	if server.Connection.Transport == "stdio" {
+		return nil, Failure(410, "TRANSPORT_RETIRED", "stdio container execution has been retired")
+	}
 	if server.Kind == "knowledge" {
 		return nil, Failure(410, "SERVICE_RETIRED", "Service type retired")
 	}

@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -258,7 +257,7 @@ func oauthClient(server *model.MCPServer, meta oauthDiscovery) (*oauth2.Config, 
 		}
 	}
 	if server.Kind == "deepseek" && server.Catalog {
-		issuer := strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")
+		issuer := strings.TrimRight(ConfigValue("casdoor_issuer"), "/")
 		if issuer == "" || issuer != meta.Issuer {
 			return nil, Failure(503, "MCP_NOT_CONFIGURED", "Configure the trusted MCP OAuth issuer")
 		}
@@ -287,7 +286,7 @@ func BeginAuthorization(ctx context.Context, row *model.MCPInstallation, session
 	if !server.Catalog || server.AuthMode != "oauth2" && server.Kind != "remote_mcp" && server.Kind != "public_knowledge" || sessionID == "" || !row.Admin && !server.Enabled {
 		return "", Failure(403, "AUTHORIZATION_UNAVAILABLE", "OAuth authorization is unavailable")
 	}
-	if _, err := ValidateEndpoint(PublicBaseURL()); err != nil {
+	if _, err := ValidateEndpoint(PublicBaseURL(ctx)); err != nil {
 		return "", Failure(503, "MCP_NOT_CONFIGURED", "Configure the public MCP base URL")
 	}
 	var cfg *oauth2.Config

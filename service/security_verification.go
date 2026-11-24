@@ -20,6 +20,7 @@ const (
 	VerificationMethodPassword           = "password"
 	VerificationMethodOAuth              = "oauth"
 	VerificationMethodSession            = "session"
+	VerificationScopeMCPConfigWrite      = "mcp.config.write"
 	VerificationScopeChannelKeyRead      = "channel.key.read"
 	VerificationScopePasskeyRegister     = "passkey.register"
 	VerificationScopePasskeyDelete       = "passkey.delete"
@@ -82,6 +83,15 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 	}
 	var normalized any
 	switch operation.Scope {
+	case VerificationScopeMCPConfigWrite:
+		var context struct {
+			Target   string `json:"target"`
+			Revision int64  `json:"revision"`
+		}
+		if len(fields) != 2 || common.Unmarshal(operation.Context, &context) != nil || context.Target == "" || len(context.Target) > 300 || context.Revision < 0 {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
 	case VerificationScopeChannelKeyRead:
 		var context ChannelKeyReadContext
 		if len(fields) != 1 || common.Unmarshal(fields["channel_id"], &context.ChannelID) != nil || context.ChannelID <= 0 {
@@ -183,7 +193,7 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 		if !state.HasTwoFA {
 			return nil, model.ErrTwoFANotEnabled
 		}
-	case VerificationScopePasskeyRegister, VerificationScopeTwoFASetup,
+	case VerificationScopeMCPConfigWrite, VerificationScopePasskeyRegister, VerificationScopeTwoFASetup,
 		VerificationScopeAccessTokenGenerate, VerificationScopeAccessTokenRevoke,
 		VerificationScopeAccountBind, VerificationScopeAccountUnbind,
 		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete:
@@ -242,7 +252,7 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 	for i := range methods {
 		if methods[i].Method == VerificationMethodPassword && !common.PasswordLoginEnabled {
 			switch scope {
-			case VerificationScopeAccountBind, VerificationScopeAccountUnbind, VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete:
+			case VerificationScopeMCPConfigWrite, VerificationScopeAccountBind, VerificationScopeAccountUnbind, VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete:
 				methods[i].Available, methods[i].Reason = false, "Password authentication is disabled."
 			}
 		}

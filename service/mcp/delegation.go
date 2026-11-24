@@ -49,6 +49,7 @@ func mcpDelegationSigningKey() ([]byte, error) {
 // Trusted applications may use only the intersection of their server allowlist
 // and the user's existing installations. Registration never grants upstream access.
 type trustedMCPApplication struct {
+	Generation           string   `json:"generation"`
 	Enabled              bool     `json:"enabled"`
 	ExchangeSecretSHA256 string   `json:"exchange_secret_sha256"`
 	CasdoorClientSecret  string   `json:"casdoor_client_secret"`
@@ -83,19 +84,19 @@ type MCPExchangeResult struct {
 
 func trustedMCPApp(clientID string) (*trustedMCPApplication, string, error) {
 	invalid := Failure(401, "INVALID_APPLICATION", "Application authentication failed")
-	path := os.Getenv("MCP_TRUSTED_APPS_FILE")
-	if path == "" {
-		return nil, "", Failure(503, "MCP_NOT_CONFIGURED", "MCP trusted applications are not configured")
-	}
-	data, err := os.ReadFile(path)
-	var apps map[string]trustedMCPApplication
-	if err != nil || len(data) > MaxArgumentBytes || common.Unmarshal(data, &apps) != nil {
-		return nil, "", Failure(503, "MCP_NOT_CONFIGURED", "MCP trusted applications are unavailable")
-	}
-	app, ok := apps[clientID]
-	if !ok || !app.Enabled || clientID == "" {
+	var row model.MCPTrustedApplication
+	if err := model.DB.First(&row, "id = ?", clientID).Error; err != nil {
 		return nil, "", invalid
 	}
+	raw, err := Open(string(row.Payload), "mcp-app:"+clientID)
+	if err != nil {
+		return nil, "", err
+	}
+	var app trustedMCPApplication
+	if common.UnmarshalJsonStr(raw, &app) != nil || !app.Enabled {
+		return nil, "", invalid
+	}
+
 	digest, err := hex.DecodeString(app.ExchangeSecretSHA256)
 	if err != nil || len(digest) != sha256.Size || app.CasdoorClientSecret == "" || len(app.ServerIDs) == 0 || app.MaxChargeQuota <= 0 || app.MaxChargeQuota > common.MaxQuota {
 		return nil, "", Failure(503, "MCP_NOT_CONFIGURED", "MCP trusted application configuration is invalid")
@@ -129,12 +130,12 @@ func verifyDelegatingUser(ctx context.Context, clientID, raw string, app *truste
 		NotBefore int64  `json:"nbf"`
 	}
 	now := time.Now()
-	organization := os.Getenv("MCP_CASDOOR_ORGANIZATION")
+	organization := ConfigValue("casdoor_organization", ctx)
 	if err != nil || identity.Claims(&claims) != nil || identity.Subject == "" || len(identity.Audience) != 1 || identity.Audience[0] != clientID || claims.Party != "" && claims.Party != clientID || organization == "" || claims.Owner != organization || claims.IssuedAt <= 0 || claims.IssuedAt > now.Unix()+30 || claims.NotBefore > now.Unix() || !slices.Contains(strings.Fields(claims.Scope), "mcp:gateway") {
 		return nil, "", time.Time{}, invalid
 	}
 	form := url.Values{"token": {raw}, "token_type_hint": {"access_token"}}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")+"/api/login/oauth/introspect", strings.NewReader(form.Encode()))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(ConfigValue("casdoor_issuer", ctx), "/")+"/api/login/oauth/introspect", strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, "", time.Time{}, err
 	}
@@ -157,10 +158,10 @@ func verifyDelegatingUser(ctx context.Context, clientID, raw string, app *truste
 	if response.StatusCode != http.StatusOK || common.DecodeJson(response.Body, &active) != nil {
 		return nil, "", time.Time{}, Failure(503, "AUTHORIZATION_UNAVAILABLE", "Casdoor authorization state cannot be verified")
 	}
-	if !active.Active || active.Issuer != strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/") || active.Subject != identity.Subject || active.ClientID != clientID || len(active.Audience) != 1 || active.Audience[0] != clientID || active.Exp <= now.Unix() || !slices.Contains(strings.Fields(active.Scope), "mcp:gateway") {
+	if !active.Active || active.Issuer != strings.TrimRight(ConfigValue("casdoor_issuer", ctx), "/") || active.Subject != identity.Subject || active.ClientID != clientID || len(active.Audience) != 1 || active.Audience[0] != clientID || active.Exp <= now.Unix() || !slices.Contains(strings.Fields(active.Scope), "mcp:gateway") {
 		return nil, "", time.Time{}, invalid
 	}
-	user, err := casdoorUser(identity.Subject)
+	user, err := casdoorUser(identity.Subject, ctx)
 	if err != nil {
 		return nil, "", time.Time{}, err
 	}
@@ -172,7 +173,7 @@ func verifyDelegatingUser(ctx context.Context, clientID, raw string, app *truste
 }
 
 func delegationPurpose() string {
-	return "new-api/mcp-delegation-jwt/v1:" + PublicBaseURL() + ":" + strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")
+	return "new-api/mcp-delegation-jwt/v1:" + PublicBaseURL() + ":" + strings.TrimRight(ConfigValue("casdoor_issuer"), "/")
 }
 
 func ExchangeMCPApplication(ctx context.Context, clientID, secret, raw string) (*MCPExchangeResult, *Actor, error) {
@@ -185,7 +186,7 @@ func ExchangeMCPApplication(ctx context.Context, clientID, secret, raw string) (
 	if secret == "" || len(secret) > 4096 || subtle.ConstantTimeCompare(expected, actual[:]) != 1 {
 		return nil, nil, Failure(401, "INVALID_APPLICATION", "Application authentication failed")
 	}
-	if _, err = ValidateEndpoint(PublicBaseURL()); err != nil {
+	if _, err = ValidateEndpoint(PublicBaseURL(ctx)); err != nil {
 		return nil, nil, Failure(503, "MCP_NOT_CONFIGURED", "MCP public URL is not configured")
 	}
 	user, subject, upstreamExpiry, err := verifyDelegatingUser(ctx, clientID, raw, app)
@@ -216,7 +217,7 @@ func ExchangeMCPApplication(ctx context.Context, clientID, secret, raw string) (
 	claims := mcpDelegationClaims{
 		TokenUse: "mcp_delegation", ClientID: clientID, Scope: mcpDelegationScope, EncryptedGrant: sealed,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer: PublicBaseURL(), Subject: strconv.Itoa(user.Id), Audience: jwt.ClaimStrings{PublicBaseURL() + "/mcp/gateway"},
+			Issuer: PublicBaseURL(ctx), Subject: strconv.Itoa(user.Id), Audience: jwt.ClaimStrings{PublicBaseURL(ctx) + "/mcp/gateway"},
 			IssuedAt: jwt.NewNumericDate(now), NotBefore: jwt.NewNumericDate(now), ExpiresAt: jwt.NewNumericDate(expires), ID: uuid.NewString(),
 		},
 	}
@@ -227,7 +228,7 @@ func ExchangeMCPApplication(ctx context.Context, clientID, secret, raw string) (
 		return nil, nil, err
 	}
 	actor := &Actor{UserID: user.Id, Group: user.Group, Subject: subject, CanCall: true, ExpiresAt: expires, Delegation: delegation}
-	return &MCPExchangeResult{AccessToken: signed, TokenType: "Bearer", ExpiresIn: expires.Unix() - now.Unix(), ExpiresAt: expires.Unix(), Scope: mcpDelegationScope, GatewayURL: PublicBaseURL() + "/mcp/gateway"}, actor, nil
+	return &MCPExchangeResult{AccessToken: signed, TokenType: "Bearer", ExpiresIn: expires.Unix() - now.Unix(), ExpiresAt: expires.Unix(), Scope: mcpDelegationScope, GatewayURL: PublicBaseURL(ctx) + "/mcp/gateway"}, actor, nil
 }
 
 func AuthenticateDelegation(ctx context.Context, authorization string) (*Actor, error) {
@@ -242,7 +243,7 @@ func AuthenticateDelegation(ctx context.Context, authorization string) (*Actor, 
 	}
 	var claims mcpDelegationClaims
 	parsed, err := jwt.ParseWithClaims(raw, &claims, func(*jwt.Token) (any, error) { return key, nil },
-		jwt.WithValidMethods([]string{"HS256"}), jwt.WithIssuer(PublicBaseURL()), jwt.WithAudience(PublicBaseURL()+"/mcp/gateway"), jwt.WithExpirationRequired(), jwt.WithIssuedAt())
+		jwt.WithValidMethods([]string{"HS256"}), jwt.WithIssuer(PublicBaseURL(ctx)), jwt.WithAudience(PublicBaseURL(ctx)+"/mcp/gateway"), jwt.WithExpirationRequired(), jwt.WithIssuedAt())
 	if err != nil || !parsed.Valid || parsed.Header["typ"] != "at+jwt" || claims.TokenUse != "mcp_delegation" || claims.ClientID == "" || claims.Scope != mcpDelegationScope || len(claims.Audience) != 1 || claims.ID == "" || claims.IssuedAt == nil || claims.NotBefore == nil || claims.ExpiresAt == nil {
 		return nil, invalid
 	}

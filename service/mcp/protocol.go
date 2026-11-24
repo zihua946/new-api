@@ -20,14 +20,19 @@ func AllowedClientOrigin(origin string) bool {
 	if origin == "" {
 		return true
 	}
-	if origin == PublicBaseURL() && origin != "" {
+	if origin != "" && (origin == PublicBaseURL() || origin == ConfigValue("dashboard_base_url")) {
 		return true
 	}
-	return slices.Contains(strings.Split(os.Getenv("MCP_ALLOWED_CLIENT_ORIGINS"), ","), origin)
+	for candidate := range strings.SplitSeq(os.Getenv("MCP_ALLOWED_CLIENT_ORIGINS"), ",") {
+		if strings.TrimRight(strings.TrimSpace(candidate), "/") == origin {
+			return true
+		}
+	}
+	return false
 }
 
 func ProtectedResourceMetadata(server *model.MCPServer) map[string]any {
-	return map[string]any{"resource": ResourceURL(server), "authorization_servers": []string{strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")}, "scopes_supported": []string{"mcp:tools:read", "mcp:tools:call"}, "bearer_methods_supported": []string{"header"}}
+	return map[string]any{"resource": ResourceURL(server), "authorization_servers": []string{strings.TrimRight(ConfigValue("casdoor_issuer"), "/")}, "scopes_supported": []string{"mcp:tools:read", "mcp:tools:call"}, "bearer_methods_supported": []string{"header"}}
 }
 
 // Each HTTP request authenticates independently. Stateless SDK sessions cannot

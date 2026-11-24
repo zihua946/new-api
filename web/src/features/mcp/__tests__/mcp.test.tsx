@@ -1043,3 +1043,45 @@ it("saves edited metadata and README text without authentication or README impor
   const saved = request.mock.calls.find(([path]) => path === "/servers/edit-service");
   expect(saved?.[2]).not.toHaveProperty("auth_mode");
 });
+
+describe('MCP database configuration', () => {
+  it('shows configuration state without returning secrets and disables saving for read-only users', async () => {
+    const { MCPConfiguration } = await import('../settings')
+    request.mockImplementation(async(path:string)=>path==='/settings/providers'?[]:({
+      revision: 1,
+      values: { oauth_client_id: 'verifier' },
+      effective: { public_base_url: 'https://gateway.test' },
+      secrets: { oauth_client_secret: true },
+    }))
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    clients.push(client)
+    render(
+      <QueryClientProvider client={client}>
+        <MCPConfiguration sensitive={false} />
+      </QueryClientProvider>
+    )
+    expect(await screen.findByDisplayValue('verifier')).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(screen.getByLabelText('Resource verifier secret')).toHaveValue('')
+  })
+  it('offers only HTTP transports when creating services', async () => {
+    const user = userEvent.setup()
+    request.mockResolvedValue([])
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    clients.push(client)
+    render(
+      <QueryClientProvider client={client}>
+        <ServerForm sensitive onClose={() => {}} />
+      </QueryClientProvider>
+    )
+    const combo = screen.getAllByRole('combobox')[0]
+    await user.click(combo)
+    expect(
+      screen.queryByRole('option', { name: 'stdio' })
+    ).not.toBeInTheDocument()
+  })
+})

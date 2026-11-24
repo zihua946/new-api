@@ -417,3 +417,25 @@ Public Knowledge 不再使用 `MCP_OAUTH_ALLOWED_CLIENT_IDS` 判断外部客户�
 安全参考沿用前节 OWASP ASVS 5.0.0 与 Authentication / Session Management / OAuth2 指引。本次明确采用请求级授权语义，不提供流内实时撤销。回归覆盖方法入口只进行一次交换/校验、增量及最终返回不重新授权、撤销后新请求拒绝、取消/过期截止，以及实际 TCP 连接复用和跨源阻断。无数据库行为修改。
 
 验证：`go test ./service/mcp ./router -count=1` 通过，本地重建部署完成。使用 Qwen 现有令牌读取已有咨询，231 条进度通知，最终 done=true、答案 450 字符，约 0.86 秒；该次验证含 HTTP 入口认证共 2 次 Casdoor 内省，全部 200，增量和最终返回不触发在线复核。
+
+
+## 14. MCP 配置后台化与 stdio 退役（2026-11-24）
+
+本节取代前文的环境变量／受信应用文件配置方式。部署仅保留 `MCP_ENABLED`、`MCP_ENCRYPTION_KEY`、`MCP_ALLOWED_CLIENT_ORIGINS`、`MCP_ALLOWED_UPSTREAM_ORIGINS`。旧业务环境变量和 `MCP_TRUSTED_APPS_FILE` 不再读取，无自动导入；请在现有 MCP 页的“设置”“受信应用”中重新填写。保留数据库与原加密根密钥，避免已有凭据不可解密。
+
+公共地址默认使用站点 ServerAddress，管理前端默认与公共地址一致；开发前端分离时填写 http://localhost:5173。认证 provider 从已有网站 OAuth provider 中选择，要求启用、sub 映射和有效 OIDC discovery；issuer 从配置派生并保存快照，原 provider 地址变化后停止信任。组织、资源令牌校验客户端及知识库连接分别配置。内省客户端身份与调用客户端准入列表不能混用；知识库引擎交换密钥与 Casdoor OAuth 密钥独立保存。秘密字段未提交表示保留，显式空字符串表示清除。
+
+受信应用记录加密存储，交换密钥保存 SHA-256 摘要（至少 32 字符随机值），Casdoor 客户端密钥可解密供在线内省使用。应用范围、启停或凭据变化使旧委托的配置摘要失效。所有配置更新使用版本条件更新，并要求 MCP 敏感写权限、CSRF 检查和绑定操作的一次性安全验证；审计不记录密钥。
+
+stdio 容器执行、命令预览和镜像安装入口已退役。已有 stdio 服务在迁移时停用，保留历史记录；新的 stdio 服务请求或旧服务执行返回 TRANSPORT_RETIRED。
+
+认证验证基线：OWASP ASVS 5.0.0；Authentication、Session Management、OAuth2、CSRF、SSRF 和 Cryptographic Storage Cheat Sheets。保留 issuer/audience/scope、PKCE、一次性 state、组织与身份绑定及在线撤销检查。本节不宣称全量 ASVS 合规。
+
+### 本轮验证记录
+
+- SQLite 3.50.4：临时数据库，运行 `go test -mod=readonly ./service/mcp ./router ./service -run 'TestMCP|TestSecurityProofBindsIdentityAndOperation' -count=1 -timeout=120s` 通过。包含权限拒绝、密钥隔离、配置版本冲突、来源配置、授权失效及历史 stdio 数据保留。
+- MySQL 8.0.46：复用仅监听 `127.0.0.1:23306` 的 `codex-mcp-test-mysql`，执行 `MCP_SERVICE_TEST_SQL_DSN='root@tcp(127.0.0.1:23306)/mcp_service_test?charset=utf8mb4&parseTime=True&loc=Local' go test -mod=readonly ./service/mcp -run '^TestMCPDatabaseSettingsAndRetiredTransport$' -v -count=1 -timeout=120s`，通过。
+- PostgreSQL 15.19：复用仅监听 `127.0.0.1:25432` 的 `codex-mcp-test-postgres`，执行 `MCP_SERVICE_TEST_SQL_DSN='postgres://postgres:<isolated-test-password>@127.0.0.1:25432/mcp_service_test?sslmode=disable' go test -mod=readonly ./service/mcp -run '^TestMCPDatabaseSettingsAndRetiredTransport$' -v -count=1 -timeout=120s`，通过。
+- 数据库回归覆盖配置加密、显式清除、条件更新、受信应用变更、请求快照、授权失效、旧 stdio 服务停用及迁移连续运行两次；MySQL/PostgreSQL 使用已有专用 MCP 测试库，SQLite 使用全新临时库。本轮不涉及独立日志库的表或驱动变更。
+- 前端受影响 MCP 测试 45 项通过；执行 `bun run typecheck`、受影响文件 oxlint、`bun run build`。本机使用 `/Users/wangheyu/.bun/bin/bun`。
+- 尚未完成最新发布版本整库升级演练及真实远程 MCP、DeepSeek、Casdoor／知识库、委托应用的端到端联调；本轮测试使用真实数据库和模拟认证／上游边界，不能替代上述发布验收。

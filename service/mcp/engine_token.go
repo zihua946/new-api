@@ -5,7 +5,6 @@ import (
 	"context"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,13 +83,13 @@ func knowledgeEngineToken(ctx context.Context, userID int, subject, base, client
 	}
 	// Public OAuth clients without an introspection secret retain the original
 	// exchange path. Caching must not weaken immediate source-grant revocation.
-	oauthSecret := os.Getenv("MCP_KNOWLEDGE_OAUTH_CLIENT_SECRET")
+	oauthSecret := ConfigValue("knowledge_oauth_client_secret", ctx)
 	if oauthSecret == "" {
 		entry, err := exchangeKnowledgeEngineToken(ctx, base, clientID, secret, grant, timeout)
 		return entry, "", err
 	}
 	key := Digest(strings.Join([]string{strconv.Itoa(userID), subject, base, clientID, secret, grant.AccessToken,
-		os.Getenv("MCP_CASDOOR_ISSUER"), os.Getenv("MCP_CASDOOR_ORGANIZATION"), os.Getenv("MCP_CASDOOR_PROVIDER_ID"), os.Getenv("MCP_KNOWLEDGE_SCOPES"), oauthSecret, strconv.FormatInt(grant.Expiry.UnixNano(), 10)}, "\x00"))
+		ConfigValue("casdoor_issuer", ctx), ConfigValue("casdoor_organization", ctx), ConfigValue("casdoor_provider_id", ctx), ConfigValue("knowledge_scopes", ctx), oauthSecret, strconv.FormatInt(grant.Expiry.UnixNano(), 10)}, "\x00"))
 	if entry, ok := knowledgeEngineTokens.load(key); ok {
 		if err := verifyKnowledgeGrantActive(ctx, clientID, oauthSecret, subject, grant.AccessToken); err != nil {
 			knowledgeEngineTokens.invalidate(key, entry.token)
@@ -132,7 +131,7 @@ func knowledgeEngineToken(ctx context.Context, userID int, subject, base, client
 }
 
 func verifyKnowledgeGrantActive(ctx context.Context, clientID, secret, subject, raw string) error {
-	issuer := strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")
+	issuer := strings.TrimRight(ConfigValue("casdoor_issuer", ctx), "/")
 	client, err := requestHTTPClient(ctx, issuer, 10*time.Second)
 	if err != nil {
 		return err

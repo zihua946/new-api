@@ -25,6 +25,7 @@ export type VerificationMethod =
   | 'oauth'
   | 'session'
 export type SecurityProofScope =
+  | 'mcp.config.write'
   | 'channel.key.read'
   | 'passkey.register'
   | 'passkey.delete'
@@ -40,6 +41,7 @@ export type SecurityProofScope =
   | 'account.delete'
 
 export type VerificationOperation =
+  | { scope: 'mcp.config.write'; context: { target: string; revision: number } }
   | { scope: 'channel.key.read'; context: { channel_id: number } }
   | {
       scope: 'account.binding.bind'
@@ -49,7 +51,10 @@ export type VerificationOperation =
   | {
       scope: Exclude<
         SecurityProofScope,
-        'channel.key.read' | 'account.binding.bind' | 'account.binding.unbind'
+        | 'channel.key.read'
+        | 'account.binding.bind'
+        | 'account.binding.unbind'
+        | 'mcp.config.write'
       >
       context?: Record<string, never>
     }

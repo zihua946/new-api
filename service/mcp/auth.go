@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -36,7 +35,7 @@ type Actor struct {
 var oidcProviders sync.Map
 
 func oauthProvider(ctx context.Context) (*oidc.Provider, *http.Client, error) {
-	issuer := strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")
+	issuer := strings.TrimRight(ConfigValue("casdoor_issuer", ctx), "/")
 	client, err := requestHTTPClient(ctx, issuer, 10*time.Second)
 	if err != nil {
 		return nil, nil, Failure(503, "MCP_NOT_CONFIGURED", "MCP authorization provider is not configured")
@@ -54,11 +53,11 @@ func oauthProvider(ctx context.Context) (*oidc.Provider, *http.Client, error) {
 	return actual.(*oidc.Provider), client, nil
 }
 
-func ResourceURL(server *model.MCPServer) string {
+func ResourceURL(server *model.MCPServer, contexts ...context.Context) string {
 	if server.Catalog && server.Kind != "remote_mcp" {
 		return server.Connection.URL
 	}
-	return PublicBaseURL() + "/mcp/" + server.Slug
+	return PublicBaseURL(contexts...) + "/mcp/" + server.Slug
 }
 
 func Authenticate(ctx context.Context, server *model.MCPServer, authorization, clientIP string) (*Actor, error) {
@@ -102,7 +101,7 @@ func AuthenticateOAuth(ctx context.Context, server *model.MCPServer, raw string)
 		return nil, err
 	}
 	defer client.CloseIdleConnections()
-	resource := ResourceURL(server)
+	resource := ResourceURL(server, ctx)
 	verified, err := provider.Verifier(&oidc.Config{ClientID: resource, SupportedSigningAlgs: []string{"RS256"}}).Verify(oidc.ClientContext(ctx, client), raw)
 	if err != nil {
 		return nil, Failure(401, "UNAUTHORIZED", "Authorization token is invalid or expired")
@@ -118,11 +117,11 @@ func AuthenticateOAuth(ctx context.Context, server *model.MCPServer, raw string)
 	if !slices.Contains(strings.Fields(claims.Scope), "mcp:tools:read") {
 		return nil, Failure(403, "INSUFFICIENT_SCOPE", "The mcp:tools:read scope is required")
 	}
-	organization := os.Getenv("MCP_CASDOOR_ORGANIZATION")
+	organization := ConfigValue("casdoor_organization", ctx)
 	if organization == "" || claims.Owner != organization {
 		return nil, Failure(403, "ORGANIZATION_NOT_ALLOWED", "Authorization organization is not allowed")
 	}
-	clientID, secret := os.Getenv("MCP_OAUTH_CLIENT_ID"), os.Getenv("MCP_OAUTH_CLIENT_SECRET")
+	clientID, secret := ConfigValue("oauth_client_id", ctx), ConfigValue("oauth_client_secret", ctx)
 	if server.Catalog && server.Kind == "deepseek" {
 		// Load the authoritative persisted registration, including when the
 		// protocol handler deliberately supplied only a public server view.
@@ -139,7 +138,7 @@ func AuthenticateOAuth(ctx context.Context, server *model.MCPServer, raw string)
 			return nil, err
 		}
 	} else if server.Kind != "public_knowledge" {
-		allowedClients := os.Getenv("MCP_OAUTH_ALLOWED_CLIENT_IDS")
+		allowedClients := ConfigValue("oauth_allowed_client_ids", ctx)
 		if allowedClients == "" {
 			allowedClients = clientID
 		}
@@ -158,7 +157,7 @@ func AuthenticateOAuth(ctx context.Context, server *model.MCPServer, raw string)
 		return nil, Failure(503, "MCP_NOT_CONFIGURED", "MCP resource verifier is not configured")
 	}
 	form := url.Values{"token": {raw}, "token_type_hint": {"access_token"}, "resource": {resource}}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")+"/api/login/oauth/introspect", strings.NewReader(form.Encode()))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(ConfigValue("casdoor_issuer", ctx), "/")+"/api/login/oauth/introspect", strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
@@ -183,13 +182,13 @@ func AuthenticateOAuth(ctx context.Context, server *model.MCPServer, raw string)
 	if response.StatusCode != http.StatusOK || common.DecodeJson(response.Body, &active) != nil {
 		return nil, Failure(503, "AUTHORIZATION_UNAVAILABLE", "Authorization state cannot be verified")
 	}
-	if !active.Active || active.Issuer != strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/") || len(active.Audience) != 1 || active.Audience[0] != resource || active.Subject != verified.Subject || active.ClientID != claims.AuthorizedParty || active.Exp <= time.Now().Unix() || !slices.Contains(strings.Fields(active.Scope), "mcp:tools:read") {
+	if !active.Active || active.Issuer != strings.TrimRight(ConfigValue("casdoor_issuer", ctx), "/") || len(active.Audience) != 1 || active.Audience[0] != resource || active.Subject != verified.Subject || active.ClientID != claims.AuthorizedParty || active.Exp <= time.Now().Unix() || !slices.Contains(strings.Fields(active.Scope), "mcp:tools:read") {
 		return nil, Failure(401, "AUTHORIZATION_REVOKED", "Authorization is no longer active")
 	}
 	if server.Kind == "public_knowledge" && (!active.ClientDynamicMCP || active.ClientOrganization != organization) {
 		return nil, Failure(403, "CLIENT_NOT_ALLOWED", "OAuth client is not an active dynamic MCP registration in the trusted organization")
 	}
-	user, err := casdoorUser(verified.Subject)
+	user, err := casdoorUser(verified.Subject, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +207,7 @@ func CanUseTool(server *model.MCPServer, tool *model.MCPTool, actor *Actor, test
 	return actor != nil && (server.Catalog || slices.Contains(server.AllowedUserGroups, actor.Group)) &&
 		(actor.Delegation == nil || actor.Delegation.AllowsServer(server.ID)) &&
 		(tool.AllowedUserGroups == nil || slices.Contains(tool.AllowedUserGroups, actor.Group)) &&
-		!server.Archived && !tool.Removed && !tool.ReviewRequired && (test || server.Enabled && tool.Enabled)
+		server.Connection.Transport != "stdio" && !server.Archived && !tool.Removed && !tool.ReviewRequired && (test || server.Enabled && tool.Enabled)
 }
 
 // InstallationActor binds upstream credentials to the platform owner.
@@ -264,10 +263,10 @@ func InstallationActor(ctx context.Context, server *model.MCPServer, actor *Acto
 	return &copy, nil
 }
 
-func casdoorUser(subject string) (*model.User, error) {
-	providerID, _ := strconv.Atoi(os.Getenv("MCP_CASDOOR_PROVIDER_ID"))
+func casdoorUser(subject string, contexts ...context.Context) (*model.User, error) {
+	providerID, _ := strconv.Atoi(ConfigValue("casdoor_provider_id", contexts...))
 	var configured model.CustomOAuthProvider
-	issuer := strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")
+	issuer := strings.TrimRight(ConfigValue("casdoor_issuer", contexts...), "/")
 	if providerID <= 0 || model.DB.First(&configured, providerID).Error != nil || !configured.Enabled || configured.UserIdField != "sub" || configured.WellKnown != issuer+"/.well-known/openid-configuration" {
 		return nil, Failure(503, "MCP_NOT_CONFIGURED", "MCP identity provider binding is not configured")
 	}

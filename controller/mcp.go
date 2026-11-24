@@ -547,17 +547,6 @@ func MCPResourceMetadata(c *gin.Context) {
 	c.JSON(200, mcpsvc.ProtectedResourceMetadata(server))
 }
 
-func MCPInstallPackage(c *gin.Context) {
-	var input struct {
-		ExpectedRevision int64 `json:"expected_revision"`
-	}
-	if !mcpDecode(c, &input) {
-		return
-	}
-	server, err := mcpsvc.InstallPackage(c.Request.Context(), c.Param("id"), input.ExpectedRevision)
-	mcpResponse(c, 200, server, err)
-}
-
 func mcpTestingActor(c *gin.Context, server *model.MCPServer) (*mcpsvc.Actor, error) {
 	admin := !strings.Contains(c.FullPath(), "/self/")
 	if !admin && (!server.Catalog || !server.Enabled) {
@@ -582,13 +571,4 @@ func MCPTestTools(c *gin.Context) {
 	}
 	tools, err := mcpsvc.AvailableTestTools(c.Request.Context(), server, actor, !strings.Contains(c.FullPath(), "/self/"))
 	mcpResponse(c, 200, tools, err)
-}
-
-func MCPCommandPreview(c *gin.Context) {
-	var connection model.MCPConnection
-	if !mcpDecode(c, &connection) {
-		return
-	}
-	args, err := mcpsvc.StdioCommand(connection)
-	mcpResponse(c, 200, args, err)
 }

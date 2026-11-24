@@ -7,10 +7,8 @@ import (
 	"errors"
 	"image/png"
 	"net/http"
-	"os"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -207,17 +205,26 @@ func NormalizeServer(server *model.MCPServer) error {
 			return Failure(422, "INVALID_PROVIDER", "Create a new instance to bind a library")
 		}
 		if server.Connection.Transport == "stdio" {
-			if server.Kind != "remote_mcp" || (server.AuthMode != "" && server.AuthMode != "none") || server.Connection.URL != "" || server.Connection.ClientID != "" || server.Connection.Scopes != "" {
-				return Failure(422, "INVALID_TRANSPORT", "stdio uses a package, command and environment")
-			}
-			server.AuthMode = "none"
-			if _, err := StdioCommand(server.Connection); err != nil {
-				return err
-			}
-			return nil
+			return Failure(410, "TRANSPORT_RETIRED", "stdio container execution has been retired")
 		}
+
 		if server.Connection.Command != "" || server.Connection.Package != "" || server.Connection.PackageDigest != "" {
 			return Failure(422, "INVALID_TRANSPORT", "Commands and packages require stdio")
+		}
+		channelID, confirmed := server.Connection.ChannelID, server.Connection.ConfirmedBaseURL
+		if server.Kind == "deepseek" && channelID > 0 {
+			channel, err := model.GetChannelById(channelID, false)
+			if err != nil || channel.Type != constant.ChannelTypeDeepSeek {
+				return Failure(422, "INVALID_CHANNEL", "A DeepSeek channel is required")
+			}
+			base := strings.TrimSuffix(strings.TrimRight(channel.GetBaseURL(), "/"), "/v1")
+			if _, err := ValidateEndpoint(base); err != nil {
+				return err
+			}
+			if confirmed != "" && confirmed != base {
+				return Failure(409, "UPSTREAM_ADDRESS_CHANGED", "Confirm the channel's current upstream address")
+			}
+			confirmed = base
 		}
 		server.Connection.URL = strings.TrimSpace(server.Connection.URL)
 		if _, err := ValidateEndpoint(server.Connection.URL); err != nil {
@@ -240,7 +247,7 @@ func NormalizeServer(server *model.MCPServer) error {
 		if server.AuthMode != "oauth2" || server.Kind != "deepseek" && strings.TrimSpace(server.Connection.ClientID) == "" || len(server.Connection.ClientID) > 256 {
 			return Failure(422, "INVALID_OAUTH_CONFIG", "OAuth2 requires a registered client ID")
 		}
-		server.Connection = model.MCPConnection{URL: server.Connection.URL, Transport: server.Connection.Transport, ClientID: strings.TrimSpace(server.Connection.ClientID), Scopes: scopes}
+		server.Connection = model.MCPConnection{URL: server.Connection.URL, Transport: server.Connection.Transport, ClientID: strings.TrimSpace(server.Connection.ClientID), Scopes: scopes, ChannelID: channelID, ConfirmedBaseURL: confirmed}
 		return nil
 	}
 	switch server.Kind {
@@ -413,8 +420,8 @@ func SetServerStatusForUser(ctx context.Context, id string, revision int64, enab
 		}
 		// Publishing is an administrative catalog operation, not a business call.
 		// Public-library access is checked with the invoking user's grant at runtime.
-		if server.Connection.Transport == "stdio" && server.Connection.PackageDigest == "" {
-			return nil, Failure(422, "PACKAGE_REQUIRED", "Install the configured package before publishing")
+		if server.Connection.Transport == "stdio" {
+			return nil, Failure(410, "TRANSPORT_RETIRED", "stdio container execution has been retired")
 		}
 
 		if server.Catalog {
@@ -432,7 +439,7 @@ func SetServerStatusForUser(ctx context.Context, id string, revision int64, enab
 		if _, err = encryptionKey(); err != nil {
 			return nil, err
 		}
-		if _, err = ValidateEndpoint(PublicBaseURL()); err != nil {
+		if _, err = ValidateEndpoint(PublicBaseURL(ctx)); err != nil {
 			return nil, Failure(503, "MCP_NOT_CONFIGURED", "Configure the public MCP base URL")
 		}
 		if !server.Catalog && server.Kind == "knowledge" && server.CredentialCiphertext == "" {
@@ -570,12 +577,11 @@ func providerConfig(server *model.MCPServer) (*model.MCPServer, error) {
 	configured := *server
 	switch server.Kind {
 	case "deepseek":
-		configured.Connection.ChannelID, _ = strconv.Atoi(os.Getenv("MCP_DEEPSEEK_CHANNEL_ID"))
-		configured.Connection.ConfirmedBaseURL = strings.TrimSuffix(strings.TrimRight(os.Getenv("MCP_DEEPSEEK_BASE_URL"), "/"), "/v1")
+		return nil, Failure(503, "MCP_NOT_CONFIGURED", "Select a DeepSeek channel in the service settings")
 	case "knowledge":
-		configured.Connection.EngineBaseURL = strings.TrimRight(os.Getenv("MCP_KNOWLEDGE_ENGINE_URL"), "/")
-		configured.Connection.ClientID = os.Getenv("MCP_KNOWLEDGE_CLIENT_ID")
-		if configured.Connection.EngineBaseURL == "" || configured.Connection.ClientID == "" || os.Getenv("MCP_KNOWLEDGE_CLIENT_SECRET") == "" {
+		configured.Connection.EngineBaseURL = strings.TrimRight(ConfigValue("knowledge_engine_url"), "/")
+		configured.Connection.ClientID = ConfigValue("knowledge_client_id")
+		if configured.Connection.EngineBaseURL == "" || configured.Connection.ClientID == "" || ConfigValue("knowledge_client_secret") == "" {
 			return nil, Failure(503, "MCP_NOT_CONFIGURED", "Knowledge provider is not configured")
 		}
 	}
@@ -586,7 +592,7 @@ func encodeRuntimeSecrets(server *model.MCPServer, headers, env map[string]strin
 	if len(headers)+len(env) == 0 {
 		return "", nil
 	}
-	if server.Kind != "remote_mcp" || len(headers) > 32 || len(env) > 64 || len(headers) > 0 && server.Connection.Transport == "stdio" || len(env) > 0 && server.Connection.Transport != "stdio" {
+	if server.Kind != "remote_mcp" || len(headers) > 32 || len(env) > 0 || len(headers) > 0 && server.Connection.Transport == "stdio" || len(env) > 0 && server.Connection.Transport != "stdio" {
 		return "", Failure(422, "INVALID_CREDENTIAL", "Credentials do not match the selected transport")
 	}
 	canonical := make(map[string]string, len(headers))

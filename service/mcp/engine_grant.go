@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 	"errors"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -19,7 +18,7 @@ import (
 )
 
 func engineGrantID(userID int) string {
-	return Digest(strings.Join([]string{os.Getenv("MCP_CASDOOR_ISSUER"), os.Getenv("MCP_KNOWLEDGE_CLIENT_ID"), strconv.Itoa(userID)}, "\x00"))
+	return Digest(strings.Join([]string{ConfigValue("casdoor_issuer"), ConfigValue("knowledge_client_id"), strconv.Itoa(userID)}, "\x00"))
 }
 
 // HasEngineAuthorization reports locally usable credentials for the catalog.
@@ -44,9 +43,9 @@ func HasEngineAuthorization(userID int) (bool, error) {
 func applicationOAuth(ctx context.Context) (*oauth2.Config, oauthDiscovery, error) {
 	var meta oauthDiscovery
 	cfgErr := Failure(503, "ENGINE_APP_NOT_CONFIGURED", "Configure the trusted knowledge application")
-	issuer := strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")
-	id := os.Getenv("MCP_KNOWLEDGE_CLIENT_ID")
-	if id == "" || issuer == "" || os.Getenv("MCP_KNOWLEDGE_CLIENT_SECRET") == "" {
+	issuer := strings.TrimRight(ConfigValue("casdoor_issuer", ctx), "/")
+	id := ConfigValue("knowledge_client_id", ctx)
+	if id == "" || issuer == "" || ConfigValue("knowledge_client_secret", ctx) == "" {
 		return nil, meta, cfgErr
 	}
 	if err := oauthMetadata(ctx, issuer+"/.well-known/openid-configuration", &meta); err != nil {
@@ -60,19 +59,19 @@ func applicationOAuth(ctx context.Context) (*oauth2.Config, oauthDiscovery, erro
 			return nil, meta, cfgErr
 		}
 	}
-	scope := os.Getenv("MCP_KNOWLEDGE_SCOPES")
+	scope := ConfigValue("knowledge_scopes", ctx)
 	if scope == "" {
 		scope = "openid system.login"
 	}
 	if !slices.Contains(strings.Fields(scope), "openid") {
 		return nil, meta, cfgErr
 	}
-	secret := os.Getenv("MCP_KNOWLEDGE_OAUTH_CLIENT_SECRET")
+	secret := ConfigValue("knowledge_oauth_client_secret", ctx)
 	style := oauth2.AuthStyleInHeader
 	if secret == "" {
 		style = oauth2.AuthStyleInParams
 	}
-	return &oauth2.Config{ClientID: id, ClientSecret: secret, RedirectURL: PublicBaseURL() + "/api/mcp/oauth/callback", Scopes: strings.Fields(scope), Endpoint: oauth2.Endpoint{AuthURL: meta.AuthURL, TokenURL: meta.TokenURL, AuthStyle: style}}, meta, nil
+	return &oauth2.Config{ClientID: id, ClientSecret: secret, RedirectURL: PublicBaseURL(ctx) + "/api/mcp/oauth/callback", Scopes: strings.Fields(scope), Endpoint: oauth2.Endpoint{AuthURL: meta.AuthURL, TokenURL: meta.TokenURL, AuthStyle: style}}, meta, nil
 }
 
 func verifiedAppIdentity(ctx context.Context, userID int, raw string) (*oidc.IDToken, error) {
@@ -81,7 +80,7 @@ func verifiedAppIdentity(ctx context.Context, userID int, raw string) (*oidc.IDT
 		return nil, err
 	}
 	defer client.CloseIdleConnections()
-	id := os.Getenv("MCP_KNOWLEDGE_CLIENT_ID")
+	id := ConfigValue("knowledge_client_id", ctx)
 	if id == "" {
 		return nil, Failure(503, "ENGINE_APP_NOT_CONFIGURED", "Configure the trusted knowledge application")
 	}
@@ -90,10 +89,10 @@ func verifiedAppIdentity(ctx context.Context, userID int, raw string) (*oidc.IDT
 		Owner string `json:"owner"`
 		Party string `json:"azp"`
 	}
-	if err != nil || len(claims.Audience) != 1 || claims.Audience[0] != id || claims.Subject == "" || claims.Claims(&extra) != nil || extra.Owner == "" || extra.Owner != os.Getenv("MCP_CASDOOR_ORGANIZATION") || extra.Party != "" && extra.Party != id {
+	if err != nil || len(claims.Audience) != 1 || claims.Audience[0] != id || claims.Subject == "" || claims.Claims(&extra) != nil || extra.Owner == "" || extra.Owner != ConfigValue("casdoor_organization", ctx) || extra.Party != "" && extra.Party != id {
 		return nil, Failure(401, "ENGINE_AUTHORIZATION_REQUIRED", "Reconnect the trusted knowledge application")
 	}
-	user, err := casdoorUser(claims.Subject)
+	user, err := casdoorUser(claims.Subject, ctx)
 	if err != nil {
 		return nil, err
 	}

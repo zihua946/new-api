@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptrace"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -167,7 +166,7 @@ func serverCredentials(server *model.MCPServer) (*CredentialsInput, error) {
 			return &credentials, nil
 		}
 		if server.Kind == "knowledge" {
-			return &CredentialsInput{ClientSecret: os.Getenv("MCP_KNOWLEDGE_CLIENT_SECRET")}, nil
+			return &CredentialsInput{ClientSecret: ConfigValue("knowledge_client_secret")}, nil
 		}
 		return &CredentialsInput{}, nil
 	}
@@ -210,7 +209,7 @@ func (t *credentialTransport) CloseIdleConnections() {
 
 func connectRemote(ctx context.Context, server *model.MCPServer, tokens ...string) (*mcpsdk.ClientSession, func(), error) {
 	if server.Connection.Transport == "stdio" {
-		return connectStdio(ctx, server)
+		return nil, nil, Failure(410, "TRANSPORT_RETIRED", "stdio container execution has been retired")
 	}
 	client, err := NewHTTPClient(server.Connection.URL, time.Duration(server.Limits.TimeoutSeconds)*time.Second)
 	if err != nil {
@@ -262,7 +261,7 @@ func engineToken(ctx context.Context, server *model.MCPServer, actor *Actor, cli
 	if err != nil {
 		return "", err
 	}
-	encoded, err := common.Marshal(map[string]any{"subject_token": actor.AccessToken, "resource": ResourceURL(server), "mcp_server_id": server.ID})
+	encoded, err := common.Marshal(map[string]any{"subject_token": actor.AccessToken, "resource": ResourceURL(server, ctx), "mcp_server_id": server.ID})
 	if err != nil {
 		return "", err
 	}

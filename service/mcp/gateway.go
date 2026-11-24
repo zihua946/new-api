@@ -46,7 +46,7 @@ func GatewayServices(ctx context.Context, actor *Actor) ([]GatewayService, error
 			// A failed grant excludes only this service; never substitute credentials.
 			continue
 		}
-		services = append(services, GatewayService{ID: server.ID, Name: server.Name, URL: PublicBaseURL() + "/mcp/" + server.ID, server: server, actor: connected})
+		services = append(services, GatewayService{ID: server.ID, Name: server.Name, URL: PublicBaseURL(ctx) + "/mcp/" + server.ID, server: server, actor: connected})
 	}
 	return services, nil
 }

@@ -51,7 +51,6 @@ func TestMCPManagementHTTPContract(t *testing.T) {
 	}
 	t.Setenv("LOG_SQL_DSN", logDSN)
 	t.Setenv("MCP_ENABLED", "true")
-	t.Setenv("MCP_PUBLIC_BASE_URL", "https://gateway.test")
 	t.Setenv("MCP_ENCRYPTION_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	common.IsMasterNode, common.RedisEnabled, common.GlobalApiRateLimitEnable = true, false, false
 	common.SQLitePath = filepath.Join(t.TempDir(), "management.db")
@@ -67,6 +66,7 @@ func TestMCPManagementHTTPContract(t *testing.T) {
 		common.SetLogDatabaseType(oldLogType)
 		common.IsMasterNode, common.RedisEnabled, common.GlobalApiRateLimitEnable, common.SQLitePath = oldMaster, oldRedis, oldRate, oldSQLite
 	})
+	setMCPSetting(t, "public_base_url", "https://gateway.test")
 	for _, entry := range []struct {
 		name string
 		role int
@@ -93,6 +93,13 @@ func TestMCPManagementHTTPContract(t *testing.T) {
 		engine.ServeHTTP(w, r)
 		return w
 	}
+	t.Run("configuration requires sensitive permission and a fresh security proof", func(t *testing.T) {
+		assert.Equal(t, 200, request("GET", "/api/mcp/settings", "admin", "", "", "").Code)
+		assert.Equal(t, 403, request("PUT", "/api/mcp/settings", "admin", `{"expected_revision":1,"values":{}}`, "", "1").Code)
+		assert.Equal(t, 403, request("PUT", "/api/mcp/settings", "root", `{"expected_revision":1,"values":{}}`, "", "1").Code)
+		assert.Equal(t, 403, request("PUT", "/api/mcp/trusted-apps/test-app", "root", `{"expected_revision":0}`, "", "1").Code)
+	})
+
 	t.Run("public library URLs expose only registered enabled bindings", func(t *testing.T) {
 		for _, kbID := range []string{"manual", "second-manual"} {
 			endpoint := mcpsvc.PublicLibraryURL("library-owner", kbID)
@@ -184,8 +191,8 @@ func TestMCPManagementHTTPContract(t *testing.T) {
 		}{
 			{`{"transport":"streamable_http","url":"https://example.com/mcp"}`, 1, 201},
 			{`{"transport":"http_sse","url":"https://example.com/sse"}`, 600, 201},
-			{`{"transport":"stdio","command":"echo 'two words'","package":"registry.test/mcp/example:1.2.3"}`, 600, 201},
-			{`{"transport":"stdio","url":"https://example.com","command":"echo"}`, 1, 422},
+			{`{"transport":"stdio","command":"echo 'two words'","package":"registry.test/mcp/example:1.2.3"}`, 600, 410},
+			{`{"transport":"stdio","url":"https://example.com","command":"echo"}`, 1, 410},
 			{`{"transport":"http_sse","url":"https://example.com","command":"echo"}`, 1, 422},
 			{`{"transport":"streamable_http","url":"https://example.com"}`, 601, 422},
 		} {
@@ -461,9 +468,9 @@ func TestMCPManagementHTTPContract(t *testing.T) {
 		}))
 		defer casdoor.Close()
 		issuer = casdoor.URL
-		t.Setenv("MCP_CASDOOR_ISSUER", issuer)
-		t.Setenv("MCP_CASDOOR_ORGANIZATION", "private-org")
-		t.Setenv("MCP_CASDOOR_PROVIDER_ID", "777")
+		setMCPSetting(t, "casdoor_issuer", issuer)
+		setMCPSetting(t, "casdoor_organization", "private-org")
+		setMCPSetting(t, "casdoor_provider_id", "777")
 		require.NoError(t, model.DB.Create(&model.CustomOAuthProvider{Id: 777, Name: "Delegation Casdoor", Slug: "delegation-casdoor", Enabled: true, UserIdField: "sub", WellKnown: issuer + "/.well-known/openid-configuration"}).Error)
 		managementKey := "management-delegated-alice"
 		for _, user := range []model.User{
@@ -509,18 +516,22 @@ func TestMCPManagementHTTPContract(t *testing.T) {
 			require.NoError(t, model.DB.Model(row).Updates(map[string]any{"authorized": true, "connection_revision": server.ConnectionRevision}).Error)
 			servers = append(servers, server)
 		}
-		configFile := filepath.Join(t.TempDir(), "trusted-mcp-apps.json")
+
 		app := map[string]any{"enabled": true, "exchange_secret_sha256": mcpsvc.Digest("exchange-secret"), "casdoor_client_secret": "casdoor-app-secret", "server_ids": []string{servers[0].ID, servers[1].ID}, "max_charge_quota": 10000}
 		otherApp := maps.Clone(app)
 		otherApp["exchange_secret_sha256"] = mcpsvc.Digest("other-exchange-secret")
 		otherApp["casdoor_client_secret"] = "other-casdoor-secret"
 		writeApp := func() {
-			data, err := common.Marshal(map[string]any{"known-engine": app, "agent-platform": otherApp})
-			require.NoError(t, err)
-			require.NoError(t, os.WriteFile(configFile, data, 0600))
+			for id, value := range map[string]map[string]any{"known-engine": app, "agent-platform": otherApp} {
+				data, err := common.Marshal(value)
+				require.NoError(t, err)
+				sealed, err := mcpsvc.Seal(string(data), "mcp-app:"+id)
+				require.NoError(t, err)
+				require.NoError(t, model.DB.Save(&model.MCPTrustedApplication{ID: id, Revision: 1, Payload: model.MCPEncryptedResult(sealed)}).Error)
+			}
 		}
 		writeApp()
-		t.Setenv("MCP_TRUSTED_APPS_FILE", configFile)
+
 		base := jwt.MapClaims{"iss": issuer, "sub": "delegated-alice", "aud": "known-engine", "azp": "known-engine", "owner": "private-org", "scope": "openid system.login mcp:gateway", "iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix()}
 		sign := func(patch jwt.MapClaims) string {
 			claims := maps.Clone(base)
@@ -859,4 +870,30 @@ func (transport *mcpDelegationTransport) RoundTrip(request *http.Request) (*http
 	request.Header.Set("Authorization", "Bearer "+transport.token)
 	request.Header.Set("Idempotency-Key", "delegate-once")
 	return http.DefaultTransport.RoundTrip(request)
+}
+
+func setMCPSetting(t *testing.T, key, value string) {
+	t.Helper()
+	var previous model.MCPSettings
+	result := model.DB.First(&previous, 1)
+	values := map[string]string{}
+	if result.Error == nil {
+		raw, err := mcpsvc.Open(string(previous.Payload), "mcp-settings")
+		require.NoError(t, err)
+		require.NoError(t, common.UnmarshalJsonStr(raw, &values))
+	}
+	values[key] = value
+	raw, err := common.Marshal(values)
+	require.NoError(t, err)
+	sealed, err := mcpsvc.Seal(string(raw), "mcp-settings")
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Save(&model.MCPSettings{ID: 1, Revision: previous.Revision + 1, Payload: model.MCPEncryptedResult(sealed)}).Error)
+	db := model.DB
+	t.Cleanup(func() {
+		if result.Error == nil {
+			require.NoError(t, db.Save(&previous).Error)
+		} else {
+			require.NoError(t, db.Delete(&model.MCPSettings{}, 1).Error)
+		}
+	})
 }

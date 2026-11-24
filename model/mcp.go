@@ -262,7 +262,7 @@ func MigrateMCP(db *gorm.DB) error {
 			return err
 		}
 	}
-	if err := db.AutoMigrate(&MCPServer{}, &MCPTool{}, &MCPDiscovery{}, &MCPInvocation{}, &MCPBillingOperation{}, &MCPTaskBinding{}, &MCPTestAuthorization{}, &MCPInstallation{}, &MCPAuthorizationFlow{}, &MCPChatTest{}, &MCPEngineGrant{}); err != nil {
+	if err := db.AutoMigrate(&MCPServer{}, &MCPTool{}, &MCPDiscovery{}, &MCPInvocation{}, &MCPBillingOperation{}, &MCPTaskBinding{}, &MCPTestAuthorization{}, &MCPInstallation{}, &MCPAuthorizationFlow{}, &MCPChatTest{}, &MCPEngineGrant{}, &MCPSettings{}, &MCPTrustedApplication{}); err != nil {
 		return err
 	}
 	// Before multi-currency pricing, both the tool price and its invocation
@@ -271,6 +271,17 @@ func MigrateMCP(db *gorm.DB) error {
 		if err := db.Model(record).Where("(currency IS NULL OR currency = '') AND unit_price_usd <> ''").
 			UpdateColumns(map[string]any{"currency": "USD", "unit_price": gorm.Expr("unit_price_usd")}).Error; err != nil {
 			return err
+		}
+	}
+	var servers []MCPServer
+	if err := db.Where("enabled = ?", true).Find(&servers).Error; err != nil {
+		return err
+	}
+	for _, server := range servers {
+		if server.Connection.Transport == "stdio" {
+			if err := db.Model(&MCPServer{}).Where("id = ?", server.ID).Update("enabled", false).Error; err != nil {
+				return err
+			}
 		}
 	}
 	return nil

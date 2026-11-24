@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -51,8 +50,8 @@ func registeredOAuthClient(ctx context.Context, server *model.MCPServer, meta oa
 		method := "none"
 		local := current.Catalog && current.Kind == "deepseek"
 		if local {
-			issuer := strings.TrimRight(os.Getenv("MCP_CASDOOR_ISSUER"), "/")
-			organization := strings.TrimSpace(os.Getenv("MCP_CASDOOR_ORGANIZATION"))
+			issuer := strings.TrimRight(ConfigValue("casdoor_issuer", ctx), "/")
+			organization := strings.TrimSpace(ConfigValue("casdoor_organization", ctx))
 			trusted, err := url.Parse(issuer)
 			if err != nil || issuer == "" || meta.Issuer != issuer || organization == "" ||
 				endpoint.Scheme != trusted.Scheme || !strings.EqualFold(endpoint.Host, trusted.Host) {
@@ -81,7 +80,7 @@ func registeredOAuthClient(ctx context.Context, server *model.MCPServer, meta oa
 			scopes = meta.Scopes
 		}
 		body, err := common.Marshal(map[string]any{
-			"client_name": "New API MCP", "redirect_uris": []string{PublicBaseURL() + "/api/mcp/oauth/callback"},
+			"client_name": "New API MCP", "redirect_uris": []string{PublicBaseURL(ctx) + "/api/mcp/oauth/callback"},
 			"grant_types": []string{"authorization_code", "refresh_token"}, "response_types": []string{"code"},
 			"token_endpoint_auth_method": method, "scope": strings.Join(scopes, " "),
 		})

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -144,4 +145,6 @@ func QuotePrice(mode, price string, currencies ...string) (*PriceQuote, error) {
 		EffectiveCredits: decimal.NewFromInt(int64(quota)).Div(unit).String()}, nil
 }
 
-func PublicBaseURL() string { return strings.TrimRight(os.Getenv("MCP_PUBLIC_BASE_URL"), "/") }
+func PublicBaseURL(contexts ...context.Context) string {
+	return strings.TrimRight(ConfigValue("public_base_url", contexts...), "/")
+}

@@ -23,6 +23,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import z from 'zod'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { CopyButton } from '@/components/copy-button'
 import { Dialog } from '@/components/dialog'
 import { LobeIconField } from '@/components/lobe-icon-field'
@@ -58,11 +59,10 @@ const schema = z
     description: z.string().max(4096),
     version: z.string().trim().max(64),
     url: z.string(),
-    command: z.string().max(4096),
-    image: z.string().max(256),
     icon: z.string(),
     readme: z.string().max(131072),
-    transport: z.enum(['streamable_http', 'http_sse', 'stdio']),
+    transport: z.enum(['streamable_http', 'http_sse']),
+    channel_id: z.number().int().min(0),
     client_id: z.string().trim().max(256),
     client_secret: z.string().max(4096),
     timeout: z.number().int().min(1).max(600),
@@ -71,12 +71,7 @@ const schema = z
   .superRefine((v, ctx) => {
     const bad = (key: string) =>
       ctx.addIssue({ code: 'custom', path: [key], message: 'Invalid value' })
-    if (v.transport === 'stdio') {
-      if (!v.image.trim()) bad('image')
-      if (!v.command.trim()) bad('command')
-    } else {
-      if (!z.url({ protocol: /^https?$/ }).safeParse(v.url).success) bad('url')
-    }
+    if (!z.url({ protocol: /^https?$/ }).safeParse(v.url).success) bad('url')
   })
 
 export function ServerForm(props: {
@@ -89,17 +84,23 @@ export function ServerForm(props: {
   const formID = useId()
   const client = useQueryClient()
   const { server } = props
+  const [confirmChannel, setConfirmChannel] = useState(false)
+  const [confirmedChannelBase, setConfirmedChannelBase] = useState<string>()
   const [headers, setHeaders] = useState<Record<string, string>>()
-  const [env, setEnv] = useState<Record<string, string>>()
   const publicConfig = useQuery({
     queryKey: ['mcp', 'oauth-config'],
     queryFn: () => mcpRequest<{ callback_url: string }>('/oauth/config'),
   })
+  const channels = useQuery({
+    queryKey: ['mcp', 'channel-options'],
+    queryFn: () =>
+      mcpRequest<{ id: number; name: string; base_url: string | null }[]>(
+        '/channel-options?kind=deepseek'
+      ),
+  })
   const storedTransport = server?.connection.transport
   const remoteTransport =
-    storedTransport === 'http_sse' || storedTransport === 'stdio'
-      ? storedTransport
-      : 'streamable_http'
+    storedTransport === 'http_sse' ? storedTransport : 'streamable_http'
   const form = useForm<z.infer<typeof schema>>({
     resolver: zodResolver(schema),
     defaultValues: {
@@ -109,9 +110,8 @@ export function ServerForm(props: {
       url: server?.connection.url ?? '',
       icon: server?.icon ?? '',
       readme: server?.readme ?? '',
-      image: server?.connection.package ?? '',
-      command: server?.connection.command ?? '',
       transport: remoteTransport,
+      channel_id: server?.connection.channel_id ?? 0,
       client_id: server?.connection.client_id ?? '',
       client_secret: '',
       timeout: server?.limits.timeout_seconds ?? 60,
@@ -119,39 +119,31 @@ export function ServerForm(props: {
     },
   })
   const transport = useWatch({ control: form.control, name: 'transport' })
-  const stdio = transport === 'stdio',
-    library = server?.kind === 'public_knowledge'
+  const library = server?.kind === 'public_knowledge'
   const [advanced, setAdvanced] = useState(false)
   const clientID = useWatch({ control: form.control, name: 'client_id' })
-  const oauth = !stdio && !library && !!clientID.trim()
+  const oauth = !library && !!clientID.trim()
   const transportLabels = {
-    stdio: 'stdio',
     http_sse: 'SSE',
     streamable_http: 'Streamable HTTP',
   }
-  const preview = useMutation({
-    mutationFn: () =>
-      mcpRequest<string[]>('/command-preview', 'POST', {
-        package: form.getValues('image'),
-        command: form.getValues('command'),
-      }),
-    onError: (e) => handleServerError(e),
-  })
   const icon = useWatch({ control: form.control, name: 'icon' })
 
   const save = useMutation({
     mutationFn: (value: z.infer<typeof schema>) => {
-      let connection: MCPServer['connection'] = {
+      const connection: MCPServer['connection'] = {
         transport: value.transport,
         url: value.url,
       }
-      if (stdio) {
-        connection = {
-          transport: 'stdio',
-          package: value.image,
-          command: value.command,
-        }
-      } else if (oauth) {
+      if (server?.kind === 'deepseek') {
+        connection.channel_id = value.channel_id
+        connection.confirmed_base_url =
+          confirmedChannelBase ??
+          (value.channel_id === server.connection.channel_id
+            ? server.connection.confirmed_base_url
+            : '')
+      }
+      if (oauth) {
         connection.client_id = value.client_id
         connection.scopes = ''
       }
@@ -167,10 +159,7 @@ export function ServerForm(props: {
           expected_revision: server?.revision,
           ...(props.sensitive
             ? {
-                ...(stdio && env !== undefined ? { env } : {}),
-                ...(!stdio && !library && headers !== undefined
-                  ? { headers }
-                  : {}),
+                ...(!library && headers !== undefined ? { headers } : {}),
                 connection,
                 ...(oauth && value.client_secret
                   ? { client_secret: value.client_secret }
@@ -200,22 +189,12 @@ export function ServerForm(props: {
     { name: 'description', label: t('Description') },
     { name: 'version', label: t('Version') },
   ]
-  if (stdio) {
-    fields.push(
-      {
-        name: 'image',
-        label: t('Versioned package'),
-        disabled: !props.sensitive,
-      },
-      { name: 'command', label: t('Command'), disabled: !props.sensitive }
-    )
-  } else {
-    fields.push({
-      name: 'url',
-      label: t('Upstream URL'),
-      disabled: !props.sensitive || library,
-    })
-  }
+  fields.push({
+    name: 'url',
+    label: t('Upstream URL'),
+    disabled: !props.sensitive || library,
+  })
+
   return (
     <Dialog
       open
@@ -239,6 +218,68 @@ export function ServerForm(props: {
             () => handleServerError(new Error(t('Invalid value')))
           )}
         >
+          {server?.kind === 'deepseek' && (
+            <FormField
+              control={form.control}
+              name='channel_id'
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>{t('Channel')}</FormLabel>
+                  <Select
+                    value={String(field.value)}
+                    onValueChange={(v) => field.onChange(Number(v))}
+                    disabled={!props.sensitive}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {channels.data?.map((channel) => (
+                        <SelectItem key={channel.id} value={String(channel.id)}>
+                          {channel.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          )}
+          {server?.kind === 'deepseek' && props.sensitive && (
+            <>
+              <Button
+                type='button'
+                variant='outline'
+                onClick={() => setConfirmChannel(true)}
+              >
+                {t('Confirm')}
+              </Button>
+              <ConfirmDialog
+                open={confirmChannel}
+                onOpenChange={setConfirmChannel}
+                title={t('Upstream URL')}
+                desc={
+                  channels.data?.find(
+                    (c) => c.id === form.getValues('channel_id')
+                  )?.base_url ??
+                  server.connection.confirmed_base_url ??
+                  ''
+                }
+                handleConfirm={() => {
+                  const base = channels.data?.find(
+                    (c) => c.id === form.getValues('channel_id')
+                  )?.base_url
+                  if (base) {
+                    setConfirmedChannelBase(
+                      base.replace(/\/+$/, '').replace(/\/v1$/, '')
+                    )
+                  }
+                  setConfirmChannel(false)
+                }}
+              />
+            </>
+          )}
           {fields.map(({ name, label, disabled }) => (
             <FormField
               key={name}
@@ -283,7 +324,6 @@ export function ServerForm(props: {
                         Streamable HTTP
                       </SelectItem>
                       <SelectItem value='http_sse'>SSE</SelectItem>
-                      <SelectItem value='stdio'>stdio</SelectItem>
                     </SelectContent>
                   </Select>
                   <FormMessage />
@@ -291,29 +331,12 @@ export function ServerForm(props: {
               )}
             />
           </div>
-          {stdio && (
-            <div className='space-y-2'>
-              <Button
-                type='button'
-                variant='outline'
-                disabled={preview.isPending}
-                onClick={() => preview.mutate()}
-              >
-                {t('Preview command')}
-              </Button>
-              {preview.data && (
-                <pre className='whitespace-pre-wrap'>
-                  {JSON.stringify(preview.data, null, 2)}
-                </pre>
-              )}
-            </div>
-          )}
           {props.sensitive && !library && (
             <SecretFields
-              key={stdio ? 'env' : 'headers'}
-              label={stdio ? t('Environment variables') : t('HTTP headers')}
+              key='headers'
+              label={t('HTTP headers')}
               configured={!!server?.credentials_configured}
-              onChange={stdio ? setEnv : setHeaders}
+              onChange={setHeaders}
             />
           )}
           <div className='space-y-2'>
@@ -381,9 +404,7 @@ export function ServerForm(props: {
             <summary className='cursor-pointer text-sm font-medium'>
               {t('Advanced settings')}
             </summary>
-            {(!server
-              ? advanced && !stdio && !library
-              : advanced && !stdio && !library) && (
+            {(!server ? advanced && !library : advanced && !library) && (
               <div className='space-y-4 rounded-lg border p-4'>
                 {(
                   [

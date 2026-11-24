@@ -43,15 +43,20 @@ func SetMCPRouter(engine *gin.Engine) {
 	self.GET("/invocations", controller.MCPInvocations)
 	self.GET("/usage", controller.MCPUsage)
 	admin := api.Group("", middleware.AdminAuth(), mcpMutationGuard)
+	admin.GET("/settings/providers", middleware.RequirePermission(authz.MCPRead), controller.MCPIdentityProviders)
+	admin.GET("/settings/check", middleware.RequirePermission(authz.MCPRead), controller.MCPCheckSettings)
+	admin.GET("/settings", middleware.RequirePermission(authz.MCPRead), controller.MCPSettings)
+	admin.PUT("/settings", middleware.RequirePermission(authz.MCPSensitiveWrite), controller.MCPSettings)
+	admin.GET("/trusted-apps", middleware.RequirePermission(authz.MCPRead), controller.MCPTrustedApps)
+	admin.PUT("/trusted-apps/:app_id", middleware.RequirePermission(authz.MCPSensitiveWrite), controller.MCPTrustedApps)
+	admin.DELETE("/trusted-apps/:app_id", middleware.RequirePermission(authz.MCPSensitiveWrite), controller.MCPTrustedApps)
 	admin.GET("/oauth/config", middleware.RequirePermission(authz.MCPRead), controller.MCPOAuthConfig)
-	admin.POST("/command-preview", middleware.RequirePermission(authz.MCPSensitiveWrite), controller.MCPCommandPreview)
 	admin.GET("/servers", middleware.RequirePermission(authz.MCPRead), controller.MCPServers)
 	admin.POST("/servers", middleware.RequirePermission(authz.MCPSensitiveWrite), controller.MCPServers)
 	admin.GET("/servers/:id", middleware.RequirePermission(authz.MCPRead), controller.MCPServer)
 	admin.PATCH("/servers/:id", middleware.RequirePermission(authz.MCPWrite), controller.MCPServer)
 	admin.DELETE("/servers/:id", middleware.RequirePermission(authz.MCPSensitiveWrite), controller.MCPServer)
 	admin.POST("/servers/:id/status", middleware.RequirePermission(authz.MCPOperate), controller.MCPServerStatus)
-	admin.POST("/servers/:id/package", middleware.RequirePermission(authz.MCPSensitiveWrite), controller.MCPInstallPackage)
 	admin.PUT("/servers/:id/credentials", middleware.RequirePermission(authz.MCPSensitiveWrite), controller.MCPCredentials)
 	admin.GET("/channel-options", middleware.RequirePermission(authz.MCPRead), controller.MCPChannelOptions)
 	admin.GET("/servers/:id/connection-info", middleware.RequirePermission(authz.MCPRead), controller.MCPConnectionInfo)
@@ -79,6 +84,7 @@ func mcpFeatureGate(c *gin.Context) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
+	c.Request = c.Request.WithContext(mcpsvc.WithSettingsSnapshot(c.Request.Context()))
 	c.Next()
 }
 

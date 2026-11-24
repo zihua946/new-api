@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -83,8 +82,8 @@ func publicLibraryClient(ctx context.Context, server *model.MCPServer, actor *Ac
 	if actor.Subject != "" && actor.Subject != subject {
 		return nil, Failure(403, "IDENTITY_MISMATCH", "The connected application belongs to a different user")
 	}
-	base := strings.TrimRight(os.Getenv("MCP_KNOWLEDGE_ENGINE_URL"), "/")
-	clientID, secret := os.Getenv("MCP_KNOWLEDGE_CLIENT_ID"), os.Getenv("MCP_KNOWLEDGE_CLIENT_SECRET")
+	base := strings.TrimRight(ConfigValue("knowledge_engine_url", ctx), "/")
+	clientID, secret := ConfigValue("knowledge_client_id", ctx), ConfigValue("knowledge_client_secret", ctx)
 	client, err := requestHTTPClient(ctx, base, time.Duration(server.Limits.TimeoutSeconds)*time.Second)
 	if err != nil || clientID == "" || secret == "" {
 		return nil, Failure(503, "ENGINE_APP_NOT_CONFIGURED", "Configure the trusted knowledge application")

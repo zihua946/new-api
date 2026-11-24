@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/QuantumNous/new-api/model"
@@ -214,7 +213,7 @@ func MCPOAuthCallback(c *gin.Context) {
 		}
 		c.Header("Cache-Control", "no-store")
 		c.Header("Referrer-Policy", "no-referrer")
-		base := strings.TrimRight(os.Getenv("MCP_DASHBOARD_BASE_URL"), "/")
+		base := strings.TrimRight(mcpsvc.ConfigValue("dashboard_base_url"), "/")
 		if base != "" {
 			parsed, err := url.Parse(base)
 			if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "" || !mcpsvc.AllowedClientOrigin(base) || (parsed.Scheme != "http" && parsed.Scheme != "https") {
