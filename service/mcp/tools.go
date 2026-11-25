@@ -192,10 +192,6 @@ func SyncTools(serverID, discoveryID string, userID int, revision int64) error {
 		if updated.RowsAffected != 1 {
 			return model.ErrMCPRevisionConflict
 		}
-		var server model.MCPServer
-		if err := tx.First(&server, "id = ?", serverID).Error; err != nil {
-			return err
-		}
 		var discovery model.MCPDiscovery
 		if err := tx.Where("id = ? AND server_id = ? AND user_id = ? AND expires_at > ?", discoveryID, serverID, userID, time.Now().UTC()).First(&discovery).Error; err != nil {
 			return err
@@ -221,9 +217,8 @@ func SyncTools(serverID, discoveryID string, userID int, revision int64) error {
 			old, exists := byName[tool.Name]
 			if !exists {
 				tool.ID, tool.ServerID, tool.Revision = uuid.NewString(), serverID, 1
-				if server.Catalog && (server.Kind == "knowledge" || server.Kind == "public_knowledge") {
-					tool.PriceMode, tool.UnitPriceUSD, tool.PriceRevision = "free", "0", 1
-				}
+				tool.Enabled = true
+				tool.PriceMode, tool.UnitPriceUSD, tool.UnitPrice, tool.Currency, tool.PriceRevision = "free", "0", "0", "USD", 1
 				if err := tx.Create(&tool).Error; err != nil {
 					return err
 				}

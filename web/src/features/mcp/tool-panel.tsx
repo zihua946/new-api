@@ -190,11 +190,7 @@ export function ToolPanel({
           {
             id: 'name',
             header: t('Tool'),
-            cell: (tool) => (
-              <Button variant='link' onClick={() => setEditing(tool)}>
-                {tool.name}
-              </Button>
-            ),
+            cell: (tool) => tool.name,
           },
           {
             id: 'status',
@@ -209,15 +205,18 @@ export function ToolPanel({
             id: 'price',
             header: t('Price'),
             cell: (tool) => {
-              if (tool.pricing) {
-                return formatToolPrice(tool.pricing)
-              }
-              return canEditPrice ? (
-                <Button variant='link' onClick={() => setEditing(tool)}>
-                  {t('Not configured')}
+              const price = tool.pricing
+                ? formatToolPrice(tool.pricing)
+                : t('Not configured')
+              return (
+                <Button
+                  variant='link'
+                  className='px-0'
+                  disabled={!canEditPrice || tool.removed}
+                  onClick={() => setEditing(tool)}
+                >
+                  {price}
                 </Button>
-              ) : (
-                t('Not configured')
               )
             },
           },
@@ -226,13 +225,6 @@ export function ToolPanel({
             header: t('Actions'),
             cell: (tool) => (
               <div className='flex flex-wrap gap-2'>
-                <Button
-                  variant='outline'
-                  disabled={!canEditPrice || tool.removed}
-                  onClick={() => setEditing(tool)}
-                >
-                  {t('Edit price')}
-                </Button>
                 {operate && (
                   <Button
                     variant='outline'

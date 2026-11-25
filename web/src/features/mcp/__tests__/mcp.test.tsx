@@ -185,7 +185,12 @@ describe("MCP tool pricing", () => {
           <ToolPanel server={{ id: "server-1" } as MCPServer} sensitive={false} operate write />
         </QueryClientProvider>,
       );
-      await user.click(await screen.findByRole("button", { name: "Edit price" }));
+      expect(await screen.findByText("web_search")).toBeVisible();
+      expect(screen.queryByRole("button", { name: "web_search" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Edit price" })).not.toBeInTheDocument();
+      const priceButton = screen.getByRole("button", { name: pricing ? "$0.001" : "Not configured" });
+      priceButton.focus();
+      await user.keyboard("{Enter}");
       const dialog = within(await screen.findByRole("dialog"));
       const price = dialog.getByRole("textbox", { name: "USD per successful call (0 is free)" });
       await user.clear(price);
@@ -210,7 +215,7 @@ describe("MCP tool pricing", () => {
         <ToolPanel server={{ id: "server-1" } as MCPServer} sensitive={false} operate write={false} />
       </QueryClientProvider>,
     );
-    expect(await screen.findByRole("button", { name: "Edit price" })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "Not configured" })).toBeDisabled();
   });
 
   it.each([
@@ -232,7 +237,7 @@ describe("MCP tool pricing", () => {
     );
     expect(await screen.findByText(expected)).toBeVisible();
     expect(screen.queryByText(/Credits|quota/)).not.toBeInTheDocument();
-    await userEvent.setup().click(screen.getByRole("button", { name: "Edit price" }));
+    await userEvent.setup().click(screen.getByRole("button", { name: expected }));
     const dialog = within(await screen.findByRole("dialog"));
     expect(dialog.getByText(expected)).toBeVisible();
     expect(dialog.queryByText(/Credits|quota/)).not.toBeInTheDocument();

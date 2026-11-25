@@ -1528,6 +1528,49 @@ func TestMCPBuiltinArguments(t *testing.T) {
 	}
 }
 
+func TestMCPToolDiscoveryDefaults(t *testing.T) {
+	setupMCPService(t)
+	ctx := context.Background()
+	for _, endpoint := range []string{
+		"https://gateway.test/mcp/providers/deepseek",
+		PublicLibraryURL("owner", "manual"),
+	} {
+		server, err := CreateServer(ServerInput{Name: "Defaults", Connection: model.MCPConnection{URL: endpoint, Transport: "streamable_http"}})
+		require.NoError(t, err)
+		discovery, err := DiscoverTools(ctx, server.ID, 71)
+		require.NoError(t, err)
+		require.NoError(t, SyncTools(server.ID, discovery["discovery_id"].(string), 71, server.Revision))
+		tools, err := ListTools(server.ID)
+		require.NoError(t, err)
+		require.Len(t, tools, 2)
+		for _, tool := range tools {
+			assert.True(t, tool.Enabled)
+			assert.False(t, tool.ReviewRequired)
+			require.NotNil(t, tool.Pricing)
+			assert.Equal(t, "free", tool.Pricing.Mode)
+			assert.Equal(t, "0", tool.Pricing.UnitPrice)
+			assert.Zero(t, tool.Pricing.ChargeQuota)
+		}
+		tool := tools[0]
+		_, err = SetToolPrice(server.ID, tool.ID, tool.Revision, "per_success", "0.002", "CNY")
+		require.NoError(t, err)
+		enabled := false
+		require.NoError(t, PatchTool(server.ID, tool.ID, ToolPatch{ExpectedRevision: tool.Revision + 1, Enabled: &enabled}, true))
+		server, err = model.GetMCPServer(server.ID)
+		require.NoError(t, err)
+		discovery, err = DiscoverTools(ctx, server.ID, 71)
+		require.NoError(t, err)
+		require.NoError(t, SyncTools(server.ID, discovery["discovery_id"].(string), 71, server.Revision))
+		tools, err = ListTools(server.ID)
+		require.NoError(t, err)
+		assert.False(t, tools[0].Enabled)
+		assert.Equal(t, "0.002", tools[0].Pricing.UnitPrice)
+		assert.Equal(t, "CNY", tools[0].Pricing.Currency)
+		assert.True(t, tools[1].Enabled)
+		assert.Zero(t, tools[1].Pricing.ChargeQuota)
+	}
+}
+
 func TestMCPRemoteDiscoveryAndSessionIsolation(t *testing.T) {
 	setupMCPService(t)
 	ctx := context.Background()
@@ -1554,9 +1597,13 @@ func TestMCPRemoteDiscoveryAndSessionIsolation(t *testing.T) {
 	require.NoError(t, SyncTools(server.ID, found["discovery_id"].(string), 71, server.Revision))
 	var tool model.MCPTool
 	require.NoError(t, model.DB.Where("server_id = ?", server.ID).First(&tool).Error)
-	assert.False(t, tool.Enabled)
-	assert.Empty(t, tool.PriceMode)
-	require.NoError(t, model.DB.Model(&tool).Updates(map[string]any{"enabled": true, "price_mode": "per_success", "unit_price_usd": "0.001", "price_revision": 2}).Error)
+	assert.True(t, tool.Enabled)
+	assert.Equal(t, "free", tool.PriceMode)
+	quote, err := toolQuote(&tool)
+	require.NoError(t, err)
+	assert.Zero(t, quote.ChargeQuota)
+	assert.Equal(t, "0", quote.UnitPrice)
+	require.NoError(t, model.DB.Model(&tool).Updates(map[string]any{"enabled": true, "price_mode": "per_success", "unit_price_usd": "0.001", "unit_price": "0.001", "price_revision": 2}).Error)
 	for _, user := range []int{71, 72} {
 		outcome, err := ExecuteAdapter(ctx, server, &tool, &Actor{UserID: user, AccessToken: "never-forward-user-token"}, map[string]any{"text": "hello"}, "", nil)
 		require.NoError(t, err)
