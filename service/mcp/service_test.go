@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -57,7 +59,6 @@ func TestMCPGatewayIsolatesUnavailableServices(t *testing.T) {
 				w.WriteHeader(tc.status)
 			}))
 			defer unavailable.Close()
-			t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", healthy.URL+","+unavailable.URL)
 			require.NoError(t, model.DB.Create(&model.User{Id: 901, Username: "gateway-isolation", Status: common.UserStatusEnabled, Group: "default"}).Error)
 			for i, endpoint := range []string{unavailable.URL, healthy.URL} {
 				id := fmt.Sprintf("gateway-isolation-%d", i)
@@ -163,7 +164,6 @@ func TestMCPOAuthCryptographicAndLiveAuthorization(t *testing.T) {
 	}))
 	t.Cleanup(provider.Close)
 	issuer = provider.URL
-	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", issuer)
 	setMCPSetting(t, "casdoor_issuer", issuer)
 	setMCPSetting(t, "casdoor_organization", "knowyet")
 	setMCPSetting(t, "casdoor_provider_id", "1")
@@ -377,7 +377,6 @@ data: {"type":"completed"}
 		setMCPSetting(t, "knowledge_client_id", "business")
 		setMCPSetting(t, "knowledge_client_secret", "engine-exchange")
 		setMCPSetting(t, "knowledge_oauth_client_secret", "casdoor-secret")
-		t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", issuer+","+engine.URL)
 		var config ServerInput
 		require.NoError(t, common.UnmarshalJsonStr(`{"name":"Manual","icon":"OpenAI","readme":"Library guide","connection":{"transport":"streamable_http","url":"https://gateway.test/mcp/providers/knowledge/library-owner/manual"}}`, &config))
 		server, err := CreateServer(config)
@@ -842,7 +841,6 @@ data: {"type":"completed"}
 			fmt.Fprint(w, `{"results":[{"title":"fixture","url":"https://example.com"}]}`)
 		}))
 		defer fixture.Close()
-		t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", issuer+","+fixture.URL)
 
 		require.NoError(t, model.DB.Create(&model.Channel{Id: 1234, Name: "local-provider", Type: constant.ChannelTypeDeepSeek, Status: common.ChannelStatusEnabled, Key: "supplier-key", BaseURL: &fixture.URL}).Error)
 		require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 100).Update("quota", 2000).Error)
@@ -934,7 +932,6 @@ func TestMCPDeepSeekExecutionAndKeyIsolation(t *testing.T) {
 		_, _ = w.Write([]byte(`{"results":[{"title":"Result","url":"https://example.com"}]}`))
 	}))
 	t.Cleanup(upstream.Close)
-	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", upstream.URL)
 	setMCPSetting(t, "casdoor_issuer", "")
 	setMCPSetting(t, "casdoor_provider_id", "")
 	user := model.User{Id: 100, Username: "mcp-user", Group: "default", Status: common.UserStatusEnabled, Quota: 1000}
@@ -1099,7 +1096,6 @@ func TestMCPDeepSeekConnectionFailureSettlement(t *testing.T) {
 		}
 	}))
 	t.Cleanup(upstream.Close)
-	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", upstream.URL)
 	user := model.User{Username: "mcp-network-user", AffCode: "mcp-network", Group: "default", Status: common.UserStatusEnabled, Quota: 1000}
 	require.NoError(t, model.DB.Create(&user).Error)
 	token := model.Token{UserId: user.Id, Key: "mcp-network-key", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000}
@@ -1109,7 +1105,7 @@ func TestMCPDeepSeekConnectionFailureSettlement(t *testing.T) {
 		name, endpoint, code, status, billing string
 		quota, requests                       int
 	}{
-		{"blocked", "https://198.18.0.1", "UPSTREAM_ADDRESS_BLOCKED", "failed", "refunded", 1000, 0},
+		{"invalid-port", "http://127.0.0.1:0", "UPSTREAM_ADDRESS_BLOCKED", "failed", "refunded", 1000, 0},
 		{"disconnected", upstream.URL, "UPSTREAM_RESULT_UNKNOWN", "unknown", "reserved", 500, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1251,7 +1247,6 @@ func TestMCPKnowledgeHTTPReuse(t *testing.T) {
 		_, _ = w.Write(encoded)
 	}))
 	t.Cleanup(upstream.Close)
-	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", upstream.URL)
 	sealed, err := Seal(`{"client_secret":"service-secret"}`, "server:knowledge-http")
 	require.NoError(t, err)
 	server := &model.MCPServer{ID: "knowledge-http", Slug: "knowledge", Kind: "knowledge", Connection: model.MCPConnection{EngineBaseURL: upstream.URL, ClientID: "engine-service"}, CredentialCiphertext: sealed, Limits: model.MCPLimits{TimeoutSeconds: 30}}
@@ -1550,7 +1545,6 @@ func TestMCPRemoteDiscoveryAndSessionIsolation(t *testing.T) {
 		transport.ServeHTTP(w, r)
 	}))
 	t.Cleanup(httpServer.Close)
-	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", httpServer.URL)
 	server, err := CreateServer(ServerInput{Slug: "remote-fixture", Name: "Remote", Kind: "remote_mcp", AllowedUserGroups: model.MCPGroups{"default"}, Connection: model.MCPConnection{URL: httpServer.URL, Transport: "streamable_http"}})
 	require.NoError(t, err)
 	server, err = SetCredentials(server.ID, CredentialsInput{ExpectedRevision: server.Revision, Headers: map[string]string{"Authorization": "Bearer service-credential"}})
@@ -1678,7 +1672,6 @@ func TestMCPCatalogTransportsAndOAuthInstallation(t *testing.T) {
 			mux := http.NewServeMux()
 			fixture := httptest.NewServer(mux)
 			defer fixture.Close()
-			t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", fixture.URL)
 			endpoint := fixture.URL + "/mcp"
 			var exchanges atomic.Int32
 			if transport == "oauth2" || transport == "oauth_sse" {
@@ -1831,7 +1824,6 @@ func TestMCPAutomaticDiscoveryAuthorization(t *testing.T) {
 	mux := http.NewServeMux()
 	fixture := httptest.NewServer(mux)
 	defer fixture.Close()
-	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", fixture.URL)
 	endpoint := fixture.URL + "/mcp"
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
 		// Some gateways omit WWW-Authenticate on their POST response.
@@ -1873,12 +1865,6 @@ func TestMCPAutomaticDiscoveryAuthorization(t *testing.T) {
 	secret, err := Open(saved.CredentialCiphertext, "oauth-client:"+saved.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "private-secret", secret)
-	blocked, err := CreateServer(ServerInput{Name: "Untrusted reserved address", Connection: model.MCPConnection{URL: "https://198.18.0.1/mcp", Transport: "streamable_http"}})
-	require.NoError(t, err)
-	_, err = DiscoverTools(t.Context(), blocked.ID, 81)
-	require.Error(t, err)
-	assert.Equal(t, "UPSTREAM_ADDRESS_BLOCKED", ErrorResponse(err).Code)
-
 }
 
 func TestMCPSharedGrantUpgradeAndRevocation(t *testing.T) {
@@ -1944,7 +1930,6 @@ func TestMCPOAuthScopeDiscovery(t *testing.T) {
 			mux := http.NewServeMux()
 			fixture := httptest.NewServer(mux)
 			defer fixture.Close()
-			t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", fixture.URL)
 			endpoint := fixture.URL + "/mcp"
 			mux.HandleFunc("/mcp", func(w http.ResponseWriter, _ *http.Request) {
 				if tc.challenge != "" {
@@ -2021,7 +2006,6 @@ func TestMCPLocalDynamicClientRegistration(t *testing.T) {
 	setMCPSetting(t, "casdoor_issuer", fixture.URL)
 	setMCPSetting(t, "casdoor_provider_id", "1")
 	require.NoError(t, model.DB.Create(&model.CustomOAuthProvider{Id: 1, Enabled: true, UserIdField: "sub", WellKnown: fixture.URL + "/.well-known/openid-configuration"}).Error)
-	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", fixture.URL)
 	endpoint := fixture.URL + "/mcp/providers/deepseek"
 	meta := oauthDiscovery{Issuer: fixture.URL, AuthURL: fixture.URL + "/authorize", TokenURL: fixture.URL + "/token", RegistrationURL: fixture.URL + "/register", Challenges: []string{"S256"}, Scopes: []string{"mcp:tools:read", "mcp:tools:call"}}
 	mux.HandleFunc("/mcp/providers/deepseek", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) })
@@ -2157,10 +2141,67 @@ func TestMCPPublicKnowledgeStreamsBeforeCompletion(t *testing.T) {
 	}
 }
 
+func TestMCPUpstreamAccessWithoutAllowlist(t *testing.T) {
+	var escaped atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		escaped.Add(1)
+	}))
+	defer other.Close()
+	for _, secure := range []bool{false, true} {
+		name := "http"
+		if secure {
+			name = "https"
+		}
+		t.Run(name, func(t *testing.T) {
+			upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/redirect" {
+					http.Redirect(w, r, other.URL, http.StatusFound)
+					return
+				}
+				fmt.Fprint(w, "private upstream")
+			}))
+			if secure {
+				upstream.StartTLS()
+			} else {
+				upstream.Start()
+			}
+			defer upstream.Close()
+			client, err := NewHTTPClient(upstream.URL, time.Second)
+			require.NoError(t, err)
+			defer client.CloseIdleConnections()
+			if secure {
+				roots := x509.NewCertPool()
+				roots.AddCert(upstream.Certificate())
+				client.Transport.(*originTransport).base.TLSClientConfig = &tls.Config{RootCAs: roots}
+			}
+			response, err := client.Get(upstream.URL)
+			require.NoError(t, err)
+			body, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			require.NoError(t, response.Body.Close())
+			assert.Equal(t, "private upstream", string(body))
+			response, err = client.Get(upstream.URL + "/redirect")
+			require.NoError(t, err)
+			require.NoError(t, response.Body.Close())
+			assert.Equal(t, http.StatusFound, response.StatusCode)
+			_, err = client.Get(other.URL)
+			require.Error(t, err)
+			assert.Zero(t, escaped.Load(), "requests must not escape the configured origin")
+		})
+	}
+	for _, endpoint := range []string{"http://10.0.0.1:8080/mcp", "http://192.168.1.2/mcp", "https://[fd00::1]/mcp"} {
+		_, err := ValidateEndpoint(endpoint)
+		require.NoError(t, err)
+	}
+	for _, endpoint := range []string{"file:///etc/passwd", "ftp://localhost", "http://user:secret@localhost", "http://localhost?secret=value", "http://localhost#fragment"} {
+		_, err := ValidateEndpoint(endpoint)
+		require.Error(t, err)
+	}
+}
+
 func TestToolInvocationHTTPConnectionReuse(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, r.RemoteAddr) }))
 	defer upstream.Close()
-	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", upstream.URL)
 	pool := &requestHTTPPool{}
 	defer pool.Close()
 	ctx := context.WithValue(t.Context(), requestHTTPPoolKey{}, pool)
@@ -2182,9 +2223,6 @@ func TestToolInvocationHTTPConnectionReuse(t *testing.T) {
 	require.NoError(t, err)
 	_, err = client.Get("https://other.example.com/introspect")
 	require.Error(t, err, "connection reuse must preserve origin pinning")
-	t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", "")
-	_, err = requestHTTPClient(ctx, upstream.URL, time.Second)
-	require.Error(t, err, "revoked origin configuration must not reuse a previously allowed transport")
 }
 
 func setMCPSetting(t *testing.T, key, value string) {

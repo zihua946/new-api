@@ -113,7 +113,7 @@
 
 **迁移与兼容。** 使用增量字段，旧价格标识 USD，保留服务 ID、安装、已设超时、凭据、历史调用与未结资金。保留旧知识提供端的原有契约和资源地址。新实例使用带稳定服务 ID 的地址。前端广场、DeepSeek 和模型对话测试属于工作区已有能力，作为兼容回归覆盖。共享额度表、缓存与现有模型付款路径的改动独立审查、按兼容顺序部署。MCP 关闭时也要验证这些公共路径。
 
-部署沿用默认关闭的 `MCP_ENABLED`、稳定的 `MCP_ENCRYPTION_KEY` 和 `MCP_PUBLIC_BASE_URL`。预注册回调为 `{MCP_PUBLIC_BASE_URL}/api/mcp/oauth/callback`。前后端分离时使用 `MCP_DASHBOARD_BASE_URL` 与 `MCP_ALLOWED_CLIENT_ORIGINS`，私有引擎和 HTTP 开发端点按完整 origin 加入 `MCP_ALLOWED_UPSTREAM_ORIGINS`。在已启用 Casdoor 的引擎中通过 `CASDOOR_TRUSTED_APPS_FILE` 登记一个受信业务应用，配置应用 ID、组织、证书、内省凭据、交换密钥摘要、所需 scope 和表中三项业务能力。与 Casdoor 核对该应用的准确回调地址，在 new-api 配置对应交换凭据。由 new-api 发布首个公开库实例做端到端验收，后续新增知识库复用此应用登记。灰度时配置 stdio 隔离执行器和包源，并确认共享钱包的所有实例均使用兼容版本。
+部署沿用默认关闭的 `MCP_ENABLED`、稳定的 `MCP_ENCRYPTION_KEY` 和 `MCP_PUBLIC_BASE_URL`。预注册回调为 `{MCP_PUBLIC_BASE_URL}/api/mcp/oauth/callback`。前后端分离时使用 `MCP_DASHBOARD_BASE_URL` 与 `MCP_ALLOWED_CLIENT_ORIGINS`，私有引擎和 HTTP 开发端点无需配置上游白名单。在已启用 Casdoor 的引擎中通过 `CASDOOR_TRUSTED_APPS_FILE` 登记一个受信业务应用，配置应用 ID、组织、证书、内省凭据、交换密钥摘要、所需 scope 和表中三项业务能力。与 Casdoor 核对该应用的准确回调地址，在 new-api 配置对应交换凭据。由 new-api 发布首个公开库实例做端到端验收，后续新增知识库复用此应用登记。灰度时配置 stdio 隔离执行器和包源，并确认共享钱包的所有实例均使用兼容版本。
 
 数据库验收使用真实 SQLite、MySQL、PostgreSQL，在空库、从届时最新发布版构建的代表库、含本工作区旧 MCP 数据的库上分别启动迁移两次。核对余额、索引与唯一性、旧价格和在途退款。主库用项目兼容的 GORM 锁及 TEXT 编码。日志变动另测独立日志库，含适用的 ClickHouse 路径。记录精确数据库版本、命令与结果，涉及版本特性时覆盖最低支持版本。回退使用兼容程序和资金恢复任务，保留原始数据供对账。
 
@@ -421,7 +421,7 @@ Public Knowledge 不再使用 `MCP_OAUTH_ALLOWED_CLIENT_IDS` 判断外部客户�
 
 ## 14. MCP 配置后台化与 stdio 退役（2026-11-24）
 
-本节取代前文的环境变量／受信应用文件配置方式。部署仅保留 `MCP_ENABLED`、`MCP_ENCRYPTION_KEY`、`MCP_ALLOWED_CLIENT_ORIGINS`、`MCP_ALLOWED_UPSTREAM_ORIGINS`。旧业务环境变量和 `MCP_TRUSTED_APPS_FILE` 不再读取，无自动导入；请在现有 MCP 页的“设置”“受信应用”中重新填写。保留数据库与原加密根密钥，避免已有凭据不可解密。
+本节取代前文的环境变量／受信应用文件配置方式。部署仅保留 `MCP_ENABLED`、`MCP_ENCRYPTION_KEY`、`MCP_ALLOWED_CLIENT_ORIGINS`。HTTP/HTTPS 上游（包括内网地址）无需白名单，仍限制请求和重定向不能跨 origin。旧业务环境变量和 `MCP_TRUSTED_APPS_FILE` 不再读取，无自动导入；请在现有 MCP 页的“设置”“受信应用”中重新填写。保留数据库与原加密根密钥，避免已有凭据不可解密。
 
 公共地址默认使用站点 ServerAddress，管理前端默认与公共地址一致；开发前端分离时填写 http://localhost:5173。认证 provider 从已有网站 OAuth provider 中选择，要求启用、sub 映射和有效 OIDC discovery；issuer 从配置派生并保存快照，原 provider 地址变化后停止信任。组织、资源令牌校验客户端及知识库连接分别配置。内省客户端身份与调用客户端准入列表不能混用；知识库引擎交换密钥与 Casdoor OAuth 密钥独立保存。秘密字段未提交表示保留，显式空字符串表示清除。
 

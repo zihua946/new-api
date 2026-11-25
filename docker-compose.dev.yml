@@ -35,7 +35,6 @@ services:
       - MCP_ENABLED=${MCP_ENABLED:-false}
       - MCP_ENCRYPTION_KEY=${MCP_ENCRYPTION_KEY:-}
       - MCP_ALLOWED_CLIENT_ORIGINS=${MCP_ALLOWED_CLIENT_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
-      - MCP_ALLOWED_UPSTREAM_ORIGINS=${MCP_ALLOWED_UPSTREAM_ORIGINS:-http://localhost:3000}
       # Local HTTP dev mode: keep Secure=false and leave TRUSTED_URL unset. This disables the refresh/logout OriginGuard so the :5173 -> :3000 dev proxy works.
       - SESSION_SECRET=${SESSION_SECRET:-}
       - SESSION_COOKIE_SECURE=false

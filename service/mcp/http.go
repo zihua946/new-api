@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,13 +23,8 @@ func NewHTTPClient(endpoint string, timeout time.Duration) (*http.Client, error)
 		return nil, err
 	}
 	origin := strings.ToLower(u.Scheme + "://" + u.Host)
-	privateAllowed := false
-	for candidate := range strings.SplitSeq(os.Getenv("MCP_ALLOWED_UPSTREAM_ORIGINS"), ",") {
-		if strings.EqualFold(strings.TrimRight(strings.TrimSpace(candidate), "/"), origin) {
-			privateAllowed = true
-		}
-	}
-	policy := &common.SSRFProtection{AllowPrivateIp: privateAllowed}
+	// Administrator-configured upstreams may use HTTP and private networks.
+	policy := &common.SSRFProtection{AllowPrivateIp: true}
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: timeout,
 		IdleConnTimeout: 30 * time.Second, MaxIdleConnsPerHost: 4, ForceAttemptHTTP2: true}
@@ -75,17 +69,6 @@ func ValidateEndpoint(value string) (*url.URL, error) {
 	u, err := url.Parse(value)
 	if err != nil || len(value) > 4096 || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" || (u.Scheme != "https" && u.Scheme != "http") {
 		return nil, Failure(422, "INVALID_ENDPOINT", "A configured HTTP(S) endpoint without credentials, query or fragment is required")
-	}
-	if u.Scheme == "http" {
-		allowed := false
-		for candidate := range strings.SplitSeq(os.Getenv("MCP_ALLOWED_UPSTREAM_ORIGINS"), ",") {
-			if strings.EqualFold(strings.TrimRight(strings.TrimSpace(candidate), "/"), u.Scheme+"://"+u.Host) {
-				allowed = true
-			}
-		}
-		if !allowed {
-			return nil, Failure(422, "INVALID_ENDPOINT", "HTTP upstreams require an explicitly trusted origin")
-		}
 	}
 	return u, nil
 }
@@ -164,7 +147,7 @@ func requestHTTPClient(ctx context.Context, endpoint string, timeout time.Durati
 	if err != nil {
 		return nil, err
 	}
-	key := strings.ToLower(u.Scheme+"://"+u.Host) + "\x00" + timeout.String() + "\x00" + os.Getenv("MCP_ALLOWED_UPSTREAM_ORIGINS")
+	key := strings.ToLower(u.Scheme+"://"+u.Host) + "\x00" + timeout.String()
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 	if pool.closed {

@@ -302,7 +302,6 @@ func TestMCPManagementHTTPContract(t *testing.T) {
 		})
 		endpoint := httptest.NewServer(sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return upstream }, nil))
 		defer endpoint.Close()
-		t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", endpoint.URL)
 		server, err := mcpsvc.CreateServer(mcpsvc.ServerInput{Icon: "OpenAI", Readme: "Fixture README", Name: "Integrated", Connection: model.MCPConnection{URL: endpoint.URL, Transport: "streamable_http"}})
 		require.NoError(t, err)
 		require.NoError(t, model.DB.Create(&model.MCPTool{ID: "echo-tool", ServerID: server.ID, Name: "echo", InputSchema: model.MCPJSON{"type": "object"}, Enabled: true, PriceMode: "per_success", UnitPriceUSD: "0.001", PriceRevision: 1, Revision: 1}).Error)
@@ -493,7 +492,6 @@ func TestMCPManagementHTTPContract(t *testing.T) {
 			handler.ServeHTTP(w, r)
 		}))
 		defer endpoint.Close()
-		t.Setenv("MCP_ALLOWED_UPSTREAM_ORIGINS", issuer+","+endpoint.URL)
 		servers := make([]*model.MCPServer, 0, 2)
 		grants := make([]model.MCPInstallation, 0, 2)
 		for _, name := range []string{"Delegated One", "Delegated Two"} {
