@@ -2172,7 +2172,7 @@ func TestMCPUpstreamAccessWithoutAllowlist(t *testing.T) {
 			if secure {
 				roots := x509.NewCertPool()
 				roots.AddCert(upstream.Certificate())
-				client.Transport.(*originTransport).base.TLSClientConfig = &tls.Config{RootCAs: roots}
+				client.Transport.(*originTransport).base.(*http.Transport).TLSClientConfig = &tls.Config{RootCAs: roots}
 			}
 			response, err := client.Get(upstream.URL)
 			require.NoError(t, err)
