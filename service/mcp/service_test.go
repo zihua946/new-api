@@ -2054,7 +2054,7 @@ func TestMCPLocalDynamicClientRegistration(t *testing.T) {
 	setMCPSetting(t, "casdoor_provider_id", "1")
 	require.NoError(t, model.DB.Create(&model.CustomOAuthProvider{Id: 1, Enabled: true, UserIdField: "sub", WellKnown: fixture.URL + "/.well-known/openid-configuration"}).Error)
 	endpoint := fixture.URL + "/mcp/providers/deepseek"
-	meta := oauthDiscovery{Issuer: fixture.URL, AuthURL: fixture.URL + "/authorize", TokenURL: fixture.URL + "/token", RegistrationURL: fixture.URL + "/register", Challenges: []string{"S256"}, Scopes: []string{"mcp:tools:read", "mcp:tools:call"}}
+	meta := oauthDiscovery{Issuer: fixture.URL, AuthURL: fixture.URL + "/authorize", TokenURL: fixture.URL + "/token", RegistrationURL: fixture.URL + "/register?organization=metadata-default&tenant=fixture", Challenges: []string{"S256"}, Scopes: []string{"mcp:tools:read", "mcp:tools:call"}}
 	mux.HandleFunc("/mcp/providers/deepseek", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) })
 	mux.HandleFunc("/.well-known/oauth-protected-resource/mcp/providers/deepseek", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"resource":%q,"authorization_servers":[%q],"scopes_supported":["mcp:tools:read","mcp:tools:call"]}`, endpoint, fixture.URL)
@@ -2066,7 +2066,8 @@ func TestMCPLocalDynamicClientRegistration(t *testing.T) {
 	})
 	mux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
 		registrations.Add(1)
-		assert.Equal(t, "mcp-local", r.URL.Query().Get("organization"))
+		assert.Equal(t, []string{"mcp-local"}, r.URL.Query()["organization"])
+		assert.Equal(t, "fixture", r.URL.Query().Get("tenant"))
 		var body map[string]any
 		assert.NoError(t, common.DecodeJson(r.Body, &body))
 		assert.Equal(t, "client_secret_basic", body["token_endpoint_auth_method"])
@@ -2086,7 +2087,10 @@ func TestMCPLocalDynamicClientRegistration(t *testing.T) {
 	assert.Equal(t, "oauth2", server.AuthMode, "an unregistered local service must never become unauthenticated")
 	for _, invalid := range []oauthDiscovery{
 		{Issuer: "https://untrusted.test", RegistrationURL: meta.RegistrationURL},
-		{Issuer: meta.Issuer, RegistrationURL: "https://untrusted.test/register"},
+		{Issuer: meta.Issuer, RegistrationURL: "https://untrusted.test/register?organization=mcp-local"},
+		{Issuer: meta.Issuer, RegistrationURL: fixture.URL + "/register?tenant=%zz"},
+		{Issuer: meta.Issuer, RegistrationURL: fixture.URL + "/register?tenant=fixture#fragment"},
+		{Issuer: meta.Issuer, RegistrationURL: strings.Replace(fixture.URL, "http://", "http://user:password@", 1) + "/register?tenant=fixture"},
 		{Issuer: meta.Issuer},
 		{Issuer: meta.Issuer, RegistrationURL: meta.RegistrationURL, Methods: []string{"none"}},
 	} {

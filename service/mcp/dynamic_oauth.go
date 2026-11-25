@@ -43,8 +43,19 @@ func registeredOAuthClient(ctx context.Context, server *model.MCPServer, meta oa
 		if meta.RegistrationURL == "" {
 			return nil, Failure(422, "OAUTH_CLIENT_REGISTRATION_REQUIRED", "The authorization server does not support dynamic client registration")
 		}
-		endpoint, err := ValidateEndpoint(meta.RegistrationURL)
+		endpoint, err := url.Parse(meta.RegistrationURL)
+		if err != nil || len(meta.RegistrationURL) > 4096 {
+			return nil, Failure(422, "INVALID_ENDPOINT", "Invalid OAuth registration endpoint")
+		}
+		query, err := url.ParseQuery(endpoint.RawQuery)
 		if err != nil {
+			return nil, Failure(422, "INVALID_ENDPOINT", "Invalid OAuth registration query")
+		}
+		// OAuth registration metadata may carry routing parameters. Validate
+		// and pin the transport separately, without dropping the request query.
+		registrationBase := *endpoint
+		registrationBase.RawQuery, registrationBase.ForceQuery = "", false
+		if _, err = ValidateEndpoint(registrationBase.String()); err != nil {
 			return nil, err
 		}
 		method := "none"
@@ -57,7 +68,6 @@ func registeredOAuthClient(ctx context.Context, server *model.MCPServer, meta oa
 				endpoint.Scheme != trusted.Scheme || !strings.EqualFold(endpoint.Host, trusted.Host) {
 				return nil, Failure(503, "MCP_NOT_CONFIGURED", "Configure the trusted MCP OAuth issuer and organization")
 			}
-			query := endpoint.Query()
 			query.Set("organization", organization)
 			endpoint.RawQuery = query.Encode()
 			// The same confidential client performs live token introspection.
@@ -87,7 +97,7 @@ func registeredOAuthClient(ctx context.Context, server *model.MCPServer, meta oa
 		if err != nil {
 			return nil, err
 		}
-		client, err := NewHTTPClient(meta.RegistrationURL, 10*time.Second)
+		client, err := NewHTTPClient(registrationBase.String(), 10*time.Second)
 		if err != nil {
 			return nil, err
 		}
